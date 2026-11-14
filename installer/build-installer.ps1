@@ -22,18 +22,15 @@ New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
 if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
-Write-Host ">>> [2/5] Publishing CleanSlate core & settings..." -ForegroundColor Cyan
+Write-Host ">>> [2/4] Publishing CleanSlate core & settings..." -ForegroundColor Cyan
 & $dotnet publish (Join-Path $rootDir "CleanSlate\CleanSlate.csproj") -c $Configuration -o $stagingDir
 & $dotnet publish (Join-Path $rootDir "CleanSlate.Settings\CleanSlate.Settings.csproj") -c $Configuration -o $stagingDir
 
-Write-Host ">>> [3/5] Publishing CleanSlate.Uninstaller (standalone win-x64)..." -ForegroundColor Cyan
-& $dotnet publish (Join-Path $scriptDir "src\CleanSlate.Uninstaller\CleanSlate.Uninstaller.csproj") -c $Configuration -r win-x64 --self-contained true -p:PublishSingleFile=true -o $stagingDir
-
-Write-Host ">>> [4/5] Archiving payload into payload.zip..." -ForegroundColor Cyan
+Write-Host ">>> [3/4] Archiving payload into payload.zip..." -ForegroundColor Cyan
 if (Test-Path $payloadZip) { Remove-Item $payloadZip -Force }
 Compress-Archive -Path "$stagingDir\*" -DestinationPath $payloadZip -CompressionLevel Optimal -Force
 
-Write-Host ">>> [5/5] Building self-contained CleanSlate-Setup.exe with embedded payload..." -ForegroundColor Cyan
+Write-Host ">>> [4/4] Building self-contained CleanSlate-Setup.exe with embedded payload..." -ForegroundColor Cyan
 & $dotnet publish (Join-Path $installerProjectDir "CleanSlate.Installer.csproj") -c $Configuration -r win-x64 --self-contained true -p:PublishSingleFile=true -o $distDir
 
 # Clean up temporary staging
