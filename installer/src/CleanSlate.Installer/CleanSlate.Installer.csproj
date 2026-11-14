@@ -22,4 +22,8 @@
     <Resource Include="Assets\CleanSlate.ico" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="payload.zip" Condition="Exists('payload.zip')" />
+  </ItemGroup>
+
 </Project>

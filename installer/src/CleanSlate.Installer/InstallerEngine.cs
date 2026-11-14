@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using CleanSlate.Core;
@@ -27,7 +29,7 @@ public static class InstallerEngine
         return Path.Combine(localAppData, "CleanSlate");
     }
 
-    public static string ResolveSourceAppDirectory()
+    public static string? ResolveSourceAppDirectory()
     {
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
 
@@ -45,8 +47,76 @@ public static class InstallerEngine
             return buildParent;
         }
 
-        // 3. Fallback to base directory itself
-        return baseDir;
+        // 3. Current directory ONLY if CleanSlate.exe is present (e.g. portable app root)
+        if (File.Exists(Path.Combine(baseDir, "CleanSlate.exe")))
+        {
+            return baseDir;
+        }
+
+        // NEVER return baseDir if CleanSlate.exe is missing!
+        return null;
+    }
+
+    private static bool TryExtractEmbeddedPayload(string targetDir, Action<string, double>? progress)
+    {
+        try
+        {
+            Assembly asm = typeof(InstallerEngine).Assembly;
+            string? resourceName = null;
+            foreach (string name in asm.GetManifestResourceNames())
+            {
+                if (name.EndsWith("payload.zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    resourceName = name;
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(resourceName))
+            {
+                return false;
+            }
+
+            using Stream? stream = asm.GetManifestResourceStream(resourceName);
+            if (stream == null)
+            {
+                return false;
+            }
+
+            progress?.Invoke("Extracting CleanSlate components...", 30);
+            using ZipArchive archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            int count = archive.Entries.Count;
+            if (count == 0) return false;
+
+            for (int i = 0; i < count; i++)
+            {
+                ZipArchiveEntry entry = archive.Entries[i];
+                if (string.IsNullOrEmpty(entry.Name))
+                {
+                    string dirPath = Path.Combine(targetDir, entry.FullName);
+                    Directory.CreateDirectory(dirPath);
+                    continue;
+                }
+
+                string destinationPath = Path.Combine(targetDir, entry.FullName);
+                string? parentDir = Path.GetDirectoryName(destinationPath);
+                if (!string.IsNullOrEmpty(parentDir))
+                {
+                    Directory.CreateDirectory(parentDir);
+                }
+
+                entry.ExtractToFile(destinationPath, overwrite: true);
+                double p = 30.0 + ((i + 1.0) / count * 35.0);
+                progress?.Invoke($"Extracting {entry.Name}...", p);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed extracting embedded payload: {ex.Message}");
+            return false;
+        }
     }
 
     public static void KillRunningProcesses()
@@ -98,39 +168,44 @@ public static class InstallerEngine
             }
             targetDir = Path.GetFullPath(Environment.ExpandEnvironmentVariables(targetDir));
 
-            string sourceDir = ResolveSourceAppDirectory();
-
-            if (!Directory.Exists(sourceDir))
-            {
-                throw new DirectoryNotFoundException($"Could not locate application files directory at: {sourceDir}");
-            }
-
             progress?.Invoke("Preparing installation directory...", 25);
             Directory.CreateDirectory(targetDir);
 
-            // Copy all payload files (excluding any installer Setup files)
-            string[] files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
-            int total = files.Length;
-            for (int i = 0; i < total; i++)
+            bool extracted = TryExtractEmbeddedPayload(targetDir, progress);
+            if (!extracted)
             {
-                string file = files[i];
-                string fileName = Path.GetFileName(file);
-                if (fileName.StartsWith("Setup.", StringComparison.OrdinalIgnoreCase))
+                string? sourceDir = ResolveSourceAppDirectory();
+                if (string.IsNullOrWhiteSpace(sourceDir) || !Directory.Exists(sourceDir) || !File.Exists(Path.Combine(sourceDir, "CleanSlate.exe")))
                 {
-                    continue;
+                    throw new FileNotFoundException(
+                        "CleanSlate application payload was not found. " +
+                        "The installer does not contain embedded files, and no valid 'CleanSlate.exe' was located alongside Setup.exe.");
                 }
 
-                string relPath = Path.GetRelativePath(sourceDir, file);
-                string destPath = Path.Combine(targetDir, relPath);
-                string? destDir = Path.GetDirectoryName(destPath);
-                if (!string.IsNullOrEmpty(destDir))
+                // Copy all payload files (excluding any installer Setup files)
+                string[] files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
+                int total = files.Length;
+                for (int i = 0; i < total; i++)
                 {
-                    Directory.CreateDirectory(destDir);
-                }
+                    string file = files[i];
+                    string fileName = Path.GetFileName(file);
+                    if (fileName.StartsWith("Setup.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
 
-                File.Copy(file, destPath, overwrite: true);
-                double p = 25.0 + ((i + 1.0) / total * 40.0);
-                progress?.Invoke($"Copying {fileName}...", p);
+                    string relPath = Path.GetRelativePath(sourceDir, file);
+                    string destPath = Path.Combine(targetDir, relPath);
+                    string? destDir = Path.GetDirectoryName(destPath);
+                    if (!string.IsNullOrEmpty(destDir))
+                    {
+                        Directory.CreateDirectory(destDir);
+                    }
+
+                    File.Copy(file, destPath, overwrite: true);
+                    double p = 25.0 + ((i + 1.0) / total * 40.0);
+                    progress?.Invoke($"Copying {fileName}...", p);
+                }
             }
 
             // Remove any legacy Setup.exe files from target directory
@@ -143,6 +218,25 @@ public static class InstallerEngine
             string targetCleanSlateExe = Path.Combine(targetDir, "CleanSlate.exe");
             string targetSettingsExe = Path.Combine(targetDir, "CleanSlate.Settings.exe");
             string targetUninstallExe = Path.Combine(targetDir, "Uninstall.exe");
+
+            if (!File.Exists(targetCleanSlateExe))
+            {
+                throw new FileNotFoundException($"Installation failed: CleanSlate.exe was not created in '{targetDir}'.");
+            }
+
+            // Ensure Uninstall.exe exists; if not extracted from payload, copy current Setup.exe as Uninstall.exe
+            if (!File.Exists(targetUninstallExe))
+            {
+                try
+                {
+                    string currentExe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                    if (File.Exists(currentExe))
+                    {
+                        File.Copy(currentExe, targetUninstallExe, overwrite: true);
+                    }
+                }
+                catch { }
+            }
 
             // Create Start Menu Shortcuts
             if (createShortcuts)

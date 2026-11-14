@@ -22,6 +22,11 @@ bld/
 ## Installer build outputs and distribution packages
 installer/app/
 installer/dist/
+installer/staging/
+**/payload.zip
+payload.zip
+dist/
+staging/
 *.nupkg
 *.snupkg
 

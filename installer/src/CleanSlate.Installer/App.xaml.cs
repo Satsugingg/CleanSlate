@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Windows;
@@ -39,13 +40,15 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        string exeName = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule?.FileName ?? "");
         bool isSilent = e.Args.Any(a => string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase) ||
                                        string.Equals(a, "/silent", StringComparison.OrdinalIgnoreCase) ||
                                        string.Equals(a, "-s", StringComparison.OrdinalIgnoreCase));
 
-        bool isUninstall = e.Args.Any(a => string.Equals(a, "--uninstall", StringComparison.OrdinalIgnoreCase) ||
-                                          string.Equals(a, "/uninstall", StringComparison.OrdinalIgnoreCase) ||
-                                          string.Equals(a, "-u", StringComparison.OrdinalIgnoreCase));
+        bool isUninstall = exeName.Equals("Uninstall", StringComparison.OrdinalIgnoreCase) ||
+                           e.Args.Any(a => string.Equals(a, "--uninstall", StringComparison.OrdinalIgnoreCase) ||
+                                           string.Equals(a, "/uninstall", StringComparison.OrdinalIgnoreCase) ||
+                                           string.Equals(a, "-u", StringComparison.OrdinalIgnoreCase));
 
         string? dirArg = null;
         for (int i = 0; i < e.Args.Length - 1; i++)

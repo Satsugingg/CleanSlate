@@ -31,16 +31,14 @@ jobs:
       - name: Build Solution (Release)
         run: dotnet build CleanSlate.sln -c Release --no-restore
 
-      - name: Publish CleanSlate Components
+      - name: Build and Package Installer & Portable Package
+        shell: pwsh
         run: |
           dotnet publish CleanSlate/CleanSlate.csproj -c Release -o dist/app
           dotnet publish CleanSlate.Settings/CleanSlate.Settings.csproj -c Release -o dist/app
           dotnet publish installer/src/CleanSlate.Uninstaller/CleanSlate.Uninstaller.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o dist/app
+          Compress-Archive -Path dist/app/* -DestinationPath installer/src/CleanSlate.Installer/payload.zip -CompressionLevel Optimal -Force
           dotnet publish installer/src/CleanSlate.Installer/CleanSlate.Installer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o dist
-
-      - name: Archive Portable Package
-        shell: pwsh
-        run: |
           Compress-Archive -Path dist/app/* -DestinationPath dist/CleanSlate-Portable.zip -Force
 
       - name: Upload Build Artifacts
