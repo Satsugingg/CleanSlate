@@ -46,7 +46,7 @@ jobs:
         with:
           name: CleanSlate-Release-Binaries
           path: |
-            dist/Setup.exe
+            dist/CleanSlate-Setup.exe
             dist/CleanSlate-Portable.zip
 
       - name: Create GitHub Release
@@ -54,7 +54,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/Setup.exe
+            dist/CleanSlate-Setup.exe
             dist/CleanSlate-Portable.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

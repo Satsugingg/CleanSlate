@@ -45,8 +45,8 @@
 
 ### Recommended: Setup Installer
 1. Head over to the [Releases](https://github.com/Satsugingg/CleanSlate/releases) page.
-2. Download the latest `Setup.exe`.
-3. Run `Setup.exe` and follow the on-screen prompts.
+2. Download the latest `CleanSlate-Setup.exe`.
+3. Run `CleanSlate-Setup.exe` and follow the on-screen prompts.
 4. CleanSlate will launch automatically and can be configured to start with Windows.
 
 ### Manual / Portable

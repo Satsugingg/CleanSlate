@@ -189,7 +189,8 @@ public static class InstallerEngine
                 {
                     string file = files[i];
                     string fileName = Path.GetFileName(file);
-                    if (fileName.StartsWith("Setup.", StringComparison.OrdinalIgnoreCase))
+                    if (fileName.StartsWith("Setup.", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.StartsWith("CleanSlate-Setup.", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -208,11 +209,13 @@ public static class InstallerEngine
                 }
             }
 
-            // Remove any legacy Setup.exe files from target directory
+            // Remove any legacy Setup.exe or CleanSlate-Setup.exe files from target directory
             foreach (string legacyExt in new[] { ".exe", ".dll", ".runtimeconfig.json", ".deps.json", ".pdb" })
             {
                 string legacySetup = Path.Combine(targetDir, "Setup" + legacyExt);
                 try { if (File.Exists(legacySetup)) File.Delete(legacySetup); } catch { }
+                string legacyCleanSlateSetup = Path.Combine(targetDir, "CleanSlate-Setup" + legacyExt);
+                try { if (File.Exists(legacyCleanSlateSetup)) File.Delete(legacyCleanSlateSetup); } catch { }
             }
 
             string targetCleanSlateExe = Path.Combine(targetDir, "CleanSlate.exe");

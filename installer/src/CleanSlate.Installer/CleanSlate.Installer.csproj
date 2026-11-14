@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <ApplicationIcon>Assets\CleanSlate.ico</ApplicationIcon>
-    <AssemblyName>Setup</AssemblyName>
+    <AssemblyName>CleanSlate-Setup</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RootNamespace>CleanSlate.Installer</RootNamespace>
     <Platforms>AnyCPU;x64</Platforms>

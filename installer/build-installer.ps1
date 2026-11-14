@@ -33,11 +33,11 @@ Write-Host ">>> [4/5] Archiving payload into payload.zip..." -ForegroundColor Cy
 if (Test-Path $payloadZip) { Remove-Item $payloadZip -Force }
 Compress-Archive -Path "$stagingDir\*" -DestinationPath $payloadZip -CompressionLevel Optimal -Force
 
-Write-Host ">>> [5/5] Building self-contained Setup.exe with embedded payload..." -ForegroundColor Cyan
+Write-Host ">>> [5/5] Building self-contained CleanSlate-Setup.exe with embedded payload..." -ForegroundColor Cyan
 & $dotnet publish (Join-Path $installerProjectDir "CleanSlate.Installer.csproj") -c $Configuration -r win-x64 --self-contained true -p:PublishSingleFile=true -o $distDir
 
 # Clean up temporary staging
 Remove-Item $payloadZip -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $scriptDir "staging") -Recurse -Force -ErrorAction SilentlyContinue
 
-Write-Host ">>> Build successful! Output: $(Join-Path $distDir 'Setup.exe')" -ForegroundColor Green
+Write-Host ">>> Build successful! Output: $(Join-Path $distDir 'CleanSlate-Setup.exe')" -ForegroundColor Green
