@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\CleanSlate\Assets\CleanSlate.ico</ApplicationIcon>
+    <AssemblyName>CleanSlate.Settings</AssemblyName>
+    <RootNamespace>CleanSlate.Settings</RootNamespace>
+    <Platforms>AnyCPU;x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\CleanSlate\Core\DesktopPositionHelper.cs" Link="Core\DesktopPositionHelper.cs" />
+    <Compile Include="..\CleanSlate\Core\KeybindHelper.cs" Link="Core\KeybindHelper.cs" />
+    <Compile Include="..\CleanSlate\Core\WindowsStartupHelper.cs" Link="Core\WindowsStartupHelper.cs" />
+    <Resource Include="..\CleanSlate\Assets\CleanSlate.ico" Link="Assets\CleanSlate.ico" />
+  </ItemGroup>
+
+</Project>

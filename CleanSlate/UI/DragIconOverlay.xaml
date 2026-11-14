@@ -1,0 +1,71 @@
+<Window x:Class="CleanSlate.UI.DragIconOverlay"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Focusable="False"
+        IsHitTestVisible="False"
+        Background="Transparent"
+        ResizeMode="NoResize"
+        Width="176"
+        Height="176">
+
+    <Grid Background="Transparent" IsHitTestVisible="False">
+        <Grid x:Name="GhostHost"
+              Width="96"
+              Height="96"
+              HorizontalAlignment="Center"
+              VerticalAlignment="Center"
+              RenderTransformOrigin="0.5,0.5"
+              Opacity="0.62"
+              IsHitTestVisible="False">
+            <Grid.RenderTransform>
+                <TransformGroup>
+                    <ScaleTransform x:Name="GhostScale" ScaleX="1" ScaleY="1" />
+                    <TranslateTransform x:Name="GhostTranslate" X="0" Y="0" />
+                </TransformGroup>
+            </Grid.RenderTransform>
+
+            <Image x:Name="GhostImage"
+                   Width="48"
+                   Height="48"
+                   Stretch="Uniform"
+                   StretchDirection="Both"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center"
+                   RenderOptions.BitmapScalingMode="HighQuality"
+                   SnapsToDevicePixels="True"
+                   IsHitTestVisible="False">
+                <Image.Effect>
+                    <DropShadowEffect Color="Black"
+                                      BlurRadius="10"
+                                      ShadowDepth="2"
+                                      Direction="270"
+                                      Opacity="0.50" />
+                </Image.Effect>
+            </Image>
+
+            <Border x:Name="FallbackIconBorder"
+                    Width="48"
+                    Height="48"
+                    CornerRadius="10"
+                    Background="#28FFFFFF"
+                    BorderBrush="#38FFFFFF"
+                    BorderThickness="1"
+                    Visibility="Collapsed"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    IsHitTestVisible="False">
+                <TextBlock Text="&#xE7C3;"
+                           FontFamily="Segoe MDL2 Assets"
+                           FontSize="22"
+                           Foreground="#CCFFFFFF"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center" />
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

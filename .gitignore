@@ -1,0 +1,42 @@
+## Visual Studio / .NET Core
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa]ny [Cc][Pp][Uu]/
+[Aa]rm/
+[Aa]rm64/
+bld/
+[Bb]uild/
+
+## Visual Studio Cache & Options
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Installer build outputs and distribution packages
+installer/app/
+installer/dist/
+*.nupkg
+*.snupkg
+
+## Logs and diagnostics
+*.log
+trace.log
+installer_crash.log
+crash.log
+
+## Temporary / Scratch files
+scratch/
+*.tmp
+*.bak
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
