@@ -381,6 +381,17 @@ internal static class NativeMethods
     public static IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong) =>
         IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, nIndex, dwNewLong) : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong.ToInt32()));
 
+    public const int ASFW_ANY = -1;
+    public const int SW_SHOW = 5;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -706,6 +717,8 @@ internal static class NativeMethods
             return;
         }
 
+        AllowSetForegroundWindow(Environment.ProcessId);
+
         IntPtr foreground = GetForegroundWindow();
         uint fgThread = foreground != IntPtr.Zero ? GetWindowThreadProcessId(foreground, out _) : 0;
         uint curThread = GetCurrentThreadId();
@@ -713,6 +726,7 @@ internal static class NativeMethods
 
         try
         {
+            ShowWindow(hwnd, SW_SHOW);
             BringWindowToTop(hwnd);
             SetForegroundWindow(hwnd);
         }

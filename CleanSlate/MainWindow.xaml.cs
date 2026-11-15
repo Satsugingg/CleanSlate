@@ -119,6 +119,7 @@ public partial class MainWindow : Window
     private bool _isShowing;
     private bool _isOpeningGenie;
     private bool _isClosingGenie;
+    private long _lastRevealCompletedTimeMs;
     private int _animationGeneration;
     private bool _isDragging;
     private Point _dragStartPoint;
@@ -519,20 +520,36 @@ public partial class MainWindow : Window
                         }
 
                         _activeGenieOverlay = null;
-                        _isOpeningGenie = false;
-                        RevealMainWindowAt(hwnd, physX, physY, physW, physH, scale, visibleRect);
+                        try
+                        {
+                            RevealMainWindowAt(hwnd, physX, physY, physW, physH, scale, visibleRect);
+                        }
+                        finally
+                        {
+                            _isOpeningGenie = false;
+                            _isShowing = false;
+                        }
                     });
                 _activeGenieOverlay.Start();
             }
             else
             {
-                _isOpeningGenie = false;
-                RevealMainWindowAt(hwnd, physX, physY, physW, physH, scale, visibleRect);
+                try
+                {
+                    RevealMainWindowAt(hwnd, physX, physY, physW, physH, scale, visibleRect);
+                }
+                finally
+                {
+                    _isOpeningGenie = false;
+                    _isShowing = false;
+                }
             }
         }
-        finally
+        catch
         {
+            _isOpeningGenie = false;
             _isShowing = false;
+            throw;
         }
     }
 
@@ -603,6 +620,7 @@ public partial class MainWindow : Window
         this.Activate();
         this.Focus();
         Keyboard.Focus(this);
+        _lastRevealCompletedTimeMs = Environment.TickCount64;
     }
 
     private void PositionAndClamp(
@@ -3495,10 +3513,55 @@ public partial class MainWindow : Window
     {
         _dragCandidateItem = null;
         CloseActiveContextMenu();
-        if (!_isShowing && !_isDragging && !_isOpeningGenie && !_isClosingGenie)
+
+        if (_isShowing || _isDragging || _isOpeningGenie || _isClosingGenie)
         {
-            HideDock();
+            return;
         }
+
+        // Suppress spurious deactivations during or right after dock summon/reveal (e.g. Genie handoff, OS focus arbitration)
+        if ((Environment.TickCount64 - _lastRevealCompletedTimeMs) < 750)
+        {
+            return;
+        }
+
+        // Never hide while rename overlay is open.
+        if (RenameOverlayHost.Visibility == Visibility.Visible)
+        {
+            return;
+        }
+
+        // Never hide if mouse is currently hovering over MainWindow.
+        if (IsMouseOver)
+        {
+            return;
+        }
+
+        // Also check physical cursor position against native window bounds.
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero && NativeMethods.GetCursorPos(out NativeMethods.POINT pt))
+        {
+            if (NativeMethods.GetWindowRect(hwnd, out NativeMethods.RECT r))
+            {
+                if (pt.X >= r.Left && pt.X <= r.Right && pt.Y >= r.Top && pt.Y <= r.Bottom)
+                {
+                    return;
+                }
+            }
+        }
+
+        // If the newly activated foreground window belongs to CleanSlate, keep the dock open.
+        IntPtr fgHwnd = NativeMethods.GetForegroundWindow();
+        if (fgHwnd != IntPtr.Zero)
+        {
+            NativeMethods.GetWindowThreadProcessId(fgHwnd, out uint fgPid);
+            if (fgPid == (uint)Environment.ProcessId)
+            {
+                return;
+            }
+        }
+
+        HideDock();
     }
 
     private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)

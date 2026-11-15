@@ -194,7 +194,7 @@ public sealed class DesktopHook : IDisposable
             dismissAction = _dismissDockAction;
         }
 
-        if (!isVisible || isDragging || dismissAction is null || (!isAnimating && (dockHwnd == IntPtr.Zero || !NativeMethods.IsWindowVisible(dockHwnd))))
+        if (!isVisible || isAnimating || isDragging || dismissAction is null || dockHwnd == IntPtr.Zero || !NativeMethods.IsWindowVisible(dockHwnd))
         {
             return false;
         }

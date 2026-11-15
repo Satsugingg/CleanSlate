@@ -239,6 +239,7 @@ public sealed class GenieOverlayWindow : Window
             {
                 try
                 {
+                    Visibility = Visibility.Hidden;
                     Close();
                 }
                 catch

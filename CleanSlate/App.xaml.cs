@@ -186,6 +186,7 @@ public partial class App : Application
         uint msg = NativeMethods.RegisterWindowMessageW(TrayIconManager.ShowDockBroadcastMessageName);
         if (msg != 0)
         {
+            NativeMethods.AllowSetForegroundWindow(NativeMethods.ASFW_ANY);
             NativeMethods.PostMessageW(NativeMethods.HWND_BROADCAST, msg, IntPtr.Zero, IntPtr.Zero);
         }
 
