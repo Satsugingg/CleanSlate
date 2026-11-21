@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Windows.Threading;
+using CleanSlate.Core;
 using CleanSlate.Models;
 using Microsoft.Win32;
 
@@ -440,15 +441,7 @@ public sealed class ConfigService
 
     public bool IsWindowsStartupEnabled()
     {
-        try
-        {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
-            return key?.GetValue(StartupValueName) is string val && !string.IsNullOrWhiteSpace(val);
-        }
-        catch
-        {
-            return Config.Settings.AutoLaunchOnStartup;
-        }
+        return WindowsStartupHelper.IsStartupEnabled();
     }
 
     public bool ToggleWindowsStartup()
@@ -464,30 +457,15 @@ public sealed class ConfigService
     {
         try
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: true)
-                ?? Registry.CurrentUser.CreateSubKey(RunRegistryPath);
-
-            if (key is null)
+            string? exePath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(exePath))
             {
-                return;
-            }
-
-            if (enabled)
-            {
-                string? exePath = Environment.ProcessPath;
-                if (!string.IsNullOrWhiteSpace(exePath))
-                {
-                    key.SetValue(StartupValueName, $"\"{exePath}\"");
-                }
-            }
-            else
-            {
-                key.DeleteValue(StartupValueName, throwOnMissingValue: false);
+                WindowsStartupHelper.ApplyStartupRegistration(exePath, enabled);
             }
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Failed to update Windows startup registry key: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"Failed to update Windows startup: {ex.Message}");
         }
     }
 

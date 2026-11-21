@@ -96,6 +96,7 @@ public sealed class DesktopHook : IDisposable
             Name = "CleanSlate.DesktopHook",
             IsBackground = true
         };
+        _lastTriggerTimeMs = Environment.TickCount64;
         _hookThread.Start();
         _startedEvent.Wait(TimeSpan.FromSeconds(3));
     }
@@ -307,6 +308,19 @@ public sealed class DesktopHook : IDisposable
         _pendingDoubleClick = false;
         NativeMethods.POINT upPt = ResolveCursorPoint(lParam);
 
+        long nowMs = Environment.TickCount64;
+        uint maxIntervalMs = NativeMethods.GetDoubleClickTime();
+        if (maxIntervalMs == 0)
+        {
+            maxIntervalMs = 500;
+        }
+
+        // If the click was held or mouse-up took longer than the double-click window, it was a hold/drag, not a double click.
+        if ((nowMs - _firstClickTimeMs) > (maxIntervalMs + 400))
+        {
+            return;
+        }
+
         // Ignore marquee drag selections started immediately after a click.
         if (Math.Abs(upPt.X - _secondClickDownPt.X) > 12 ||
             Math.Abs(upPt.Y - _secondClickDownPt.Y) > 12)
@@ -316,7 +330,6 @@ public sealed class DesktopHook : IDisposable
 
         if (!IsDockCurrentlyActive() && IsDesktopSurfaceAtPoint(upPt))
         {
-            long nowMs = Environment.TickCount64;
             if ((nowMs - _lastTriggerTimeMs) >= 350)
             {
                 _lastTriggerTimeMs = nowMs;

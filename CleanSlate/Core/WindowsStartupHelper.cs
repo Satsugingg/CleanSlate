@@ -31,14 +31,67 @@ public static class WindowsStartupHelper
 
         if (enabled)
         {
-            RegisterLogonTask(exePath);
+            bool taskRegistered = RegisterLogonTask(exePath);
             SetExplorerStartupDelayBypass(enabled: true);
-            SetRunRegistryKey(exePath, enabled: true);
+
+            if (taskRegistered)
+            {
+                // When Task Scheduler provides zero-delay logon startup, remove the HKCU Run key
+                // so Windows Explorer does not launch a duplicate instance after boot!
+                SetRunRegistryKey(exePath, enabled: false);
+            }
+            else
+            {
+                // Fallback to traditional Run registry key if Task Scheduler is unavailable
+                SetRunRegistryKey(exePath, enabled: true);
+            }
         }
         else
         {
             UnregisterLogonTask();
             SetRunRegistryKey(exePath, enabled: false);
+            SetExplorerStartupDelayBypass(enabled: false);
+        }
+    }
+
+    public static bool IsStartupEnabled()
+    {
+        if (IsLogonTaskRegistered())
+        {
+            return true;
+        }
+
+        try
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
+            return key?.GetValue(StartupValueName) is string val && !string.IsNullOrWhiteSpace(val);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool IsLogonTaskRegistered()
+    {
+        try
+        {
+            Type? schedulerType = Type.GetTypeFromProgID("Schedule.Service");
+            if (schedulerType is null)
+            {
+                return false;
+            }
+
+            dynamic scheduler = Activator.CreateInstance(schedulerType)!;
+            scheduler.Connect();
+
+            dynamic rootFolder = scheduler.GetFolder(@"\");
+            dynamic task = rootFolder.GetTask(TaskName);
+            return task is not null && task.Enabled;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -73,6 +126,7 @@ public static class WindowsStartupHelper
 
             dynamic action = taskDef.Actions.Create(0); // TASK_ACTION_EXEC
             action.Path = exePath;
+            action.Arguments = "--startup";
             action.WorkingDirectory = Path.GetDirectoryName(exePath) ?? string.Empty;
 
             dynamic settings = taskDef.Settings;
@@ -152,7 +206,7 @@ public static class WindowsStartupHelper
 
             if (enabled)
             {
-                key.SetValue(StartupValueName, $"\"{exePath}\"");
+                key.SetValue(StartupValueName, $"\"{exePath}\" --startup");
             }
             else
             {

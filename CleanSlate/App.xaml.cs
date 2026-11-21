@@ -26,9 +26,18 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        bool isStartupLaunch = IsStartupOrSilentLaunch(e.Args);
+
         if (!AcquireSingleInstanceMutex())
         {
-            NotifyExistingInstanceAndExit();
+            if (!isStartupLaunch)
+            {
+                NotifyExistingInstanceAndExit();
+            }
+            else
+            {
+                Shutdown(0);
+            }
             return;
         }
 
@@ -85,13 +94,11 @@ public partial class App : Application
                 () => _mainWindow.OpenRecycleBinFolder());
             _trayIconManager.Initialize();
 
-            if (_configService.Config.Settings.AutoLaunchOnStartup)
+            string? currentExe = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(currentExe))
             {
-                string? currentExe = Environment.ProcessPath;
-                if (!string.IsNullOrWhiteSpace(currentExe))
-                {
-                    _ = Task.Run(() => WindowsStartupHelper.ApplyStartupRegistration(currentExe, enabled: true));
-                }
+                bool startupEnabled = _configService.Config.Settings.AutoLaunchOnStartup;
+                _ = Task.Run(() => WindowsStartupHelper.ApplyStartupRegistration(currentExe, startupEnabled));
             }
         }
         catch (Exception ex)
@@ -179,6 +186,25 @@ public partial class App : Application
             Debug.WriteLine($"AcquireSingleInstanceMutex exception: {ex.Message}");
             return true;
         }
+    }
+
+    private static bool IsStartupOrSilentLaunch(string[]? args)
+    {
+        if (args is null || args.Length == 0)
+        {
+            return false;
+        }
+
+        return args.Any(a =>
+            string.Equals(a, "--startup", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "-startup", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "/startup", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "-silent", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "/silent", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "--background", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "-background", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a, "/background", StringComparison.OrdinalIgnoreCase));
     }
 
     private void NotifyExistingInstanceAndExit()

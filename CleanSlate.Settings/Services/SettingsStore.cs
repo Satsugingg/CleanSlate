@@ -193,8 +193,7 @@ public sealed class SettingsStore
     {
         try
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
-            return key?.GetValue(StartupValueName) is string val && !string.IsNullOrWhiteSpace(val);
+            return CleanSlate.Core.WindowsStartupHelper.IsStartupEnabled();
         }
         catch
         {
