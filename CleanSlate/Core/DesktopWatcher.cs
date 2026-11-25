@@ -36,10 +36,15 @@ public sealed class DesktopWatcher : IDisposable
         "New ZIP"
     };
 
+    private readonly record struct ExistingItemSnapshot(string Path, string FileName);
+    private readonly record struct ExistingItemMetadataUpdate(string FileName, string DestPath, string EntryPath, DesktopIconPoint? Point);
+
     private readonly ConfigService _configService;
     private readonly IconExtractor _iconExtractor;
     private readonly Dispatcher _uiDispatcher;
     private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly object _watcherLock = new();
+    private readonly object _moveLock = new();
     private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
@@ -58,30 +63,98 @@ public sealed class DesktopWatcher : IDisposable
     public void Start()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_watchers.Count > 0)
+        lock (_watcherLock)
         {
-            return;
+            if (_watchers.Count > 0)
+            {
+                return;
+            }
         }
 
         IngestExistingDesktopFiles();
 
-        foreach (string dir in GetDesktopDirectories())
+        lock (_watcherLock)
         {
-            AttachWatcher(dir);
+            if (_disposed || _watchers.Count > 0)
+            {
+                return;
+            }
+
+            foreach (string dir in GetDesktopDirectories())
+            {
+                AttachWatcher(dir);
+            }
         }
     }
 
     public void Stop()
     {
-        foreach (FileSystemWatcher watcher in _watchers)
+        lock (_watcherLock)
         {
-            watcher.EnableRaisingEvents = false;
-            watcher.Created -= OnFileCreated;
-            watcher.Renamed -= OnFileRenamed;
-            watcher.Error -= OnWatcherError;
-            watcher.Dispose();
+            foreach (FileSystemWatcher watcher in _watchers)
+            {
+                watcher.EnableRaisingEvents = false;
+                watcher.Created -= OnFileCreated;
+                watcher.Renamed -= OnFileRenamed;
+                watcher.Error -= OnWatcherError;
+                watcher.Dispose();
+            }
+            _watchers.Clear();
         }
-        _watchers.Clear();
+    }
+
+    private void RestartWatchers()
+    {
+        lock (_watcherLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            foreach (FileSystemWatcher watcher in _watchers)
+            {
+                watcher.EnableRaisingEvents = false;
+                watcher.Created -= OnFileCreated;
+                watcher.Renamed -= OnFileRenamed;
+                watcher.Error -= OnWatcherError;
+                watcher.Dispose();
+            }
+            _watchers.Clear();
+
+            foreach (string dir in GetDesktopDirectories())
+            {
+                AttachWatcher(dir);
+            }
+        }
+    }
+
+    private List<ExistingItemSnapshot> CaptureExistingItemsSnapshot(out int nonSettingsItemCount)
+    {
+        int count = 0;
+        List<ExistingItemSnapshot> BuildSnapshot()
+        {
+            var list = new List<ExistingItemSnapshot>(_configService.Config.Items.Count);
+            foreach (DockItem item in _configService.Config.Items)
+            {
+                if (string.Equals(item.Id, MainWindow.SpecialSettingsId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                count++;
+                string fileName = !string.IsNullOrWhiteSpace(item.Path) ? Path.GetFileName(item.Path) : string.Empty;
+                list.Add(new ExistingItemSnapshot(item.Path, fileName));
+            }
+            return list;
+        }
+
+        List<ExistingItemSnapshot> result = _uiDispatcher.CheckAccess() || _uiDispatcher.HasShutdownStarted
+            ? BuildSnapshot()
+            : _uiDispatcher.Invoke(BuildSnapshot);
+
+        nonSettingsItemCount = count;
+        return result;
     }
 
     /// <summary>
@@ -94,12 +167,17 @@ public sealed class DesktopWatcher : IDisposable
         bool configUpdated = false;
         var modifiedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var itemsToAdd = new List<DockItem>();
+        var existingUpdates = new List<ExistingItemMetadataUpdate>();
         _configService.EnsureDirectories();
 
+        List<ExistingItemSnapshot> existingSnapshot = CaptureExistingItemsSnapshot(out int existingNonSettingsCount);
+
         Dictionary<string, DesktopIconPoint> capturedPositions = CaptureDesktopPositionsSafe();
-        if (capturedPositions.TryGetValue(DesktopPositionHelper.RecycleBinParsingPath, out DesktopIconPoint rbPt))
+        DesktopIconPoint? capturedRbPos = capturedPositions.TryGetValue(DesktopPositionHelper.RecycleBinParsingPath, out DesktopIconPoint rbPt)
+            ? rbPt
+            : null;
+        if (capturedRbPos is not null)
         {
-            _configService.Config.RecycleBinPosition = new SavedIconPosition { X = rbPt.X, Y = rbPt.Y };
             configUpdated = true;
         }
 
@@ -112,7 +190,7 @@ public sealed class DesktopWatcher : IDisposable
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Failed to enumerate '{dir}': {ex.Message}");
+                AppLogger.Warn($"Failed to enumerate '{dir}': {ex.Message}");
                 continue;
             }
 
@@ -137,36 +215,33 @@ public sealed class DesktopWatcher : IDisposable
                         : null;
 
                     string fileName = Path.GetFileName(entryPath);
-                    string destPath = Path.Combine(_configService.ShortcutsDirectory, fileName);
-                    if (!TryMoveImmediate(entryPath, destPath, isDirectory))
+                    string destPath;
+                    lock (_moveLock)
                     {
-                        continue;
+                        destPath = BuildUniqueDestinationPath(_configService.ShortcutsDirectory, fileName, isDirectory);
+                        if (!TryMoveImmediate(entryPath, destPath, isDirectory))
+                        {
+                            continue;
+                        }
                     }
 
                     NotifyShellEntryRemoved(entryPath, isDirectory, notifyDirectory: false);
                     modifiedDirs.Add(dir);
 
-                    // Check if an item representing this shortcut already exists in itemsToAdd or Config.Items
-                    bool alreadyExists = itemsToAdd.Any(i =>
-                        string.Equals(i.Path, destPath, StringComparison.OrdinalIgnoreCase) ||
-                        (!string.IsNullOrWhiteSpace(i.Path) && string.Equals(Path.GetFileName(i.Path), fileName, StringComparison.OrdinalIgnoreCase))) ||
-                        _configService.Config.Items.Any(i =>
+                    // Check if an item representing this shortcut already exists in itemsToAdd or existing Config.Items snapshot.
+                    bool alreadyInNew = itemsToAdd.Any(i =>
                         string.Equals(i.Path, destPath, StringComparison.OrdinalIgnoreCase) ||
                         (!string.IsNullOrWhiteSpace(i.Path) && string.Equals(Path.GetFileName(i.Path), fileName, StringComparison.OrdinalIgnoreCase)));
+                    bool alreadyInConfig = existingSnapshot.Any(i =>
+                        string.Equals(i.Path, destPath, StringComparison.OrdinalIgnoreCase) ||
+                        (!string.IsNullOrWhiteSpace(i.FileName) && string.Equals(i.FileName, fileName, StringComparison.OrdinalIgnoreCase)));
 
-                    if (alreadyExists)
+                    if (alreadyInNew || alreadyInConfig)
                     {
-                        var existingItem = _configService.Config.Items.FirstOrDefault(i =>
-                            string.Equals(i.Path, destPath, StringComparison.OrdinalIgnoreCase) ||
-                            (!string.IsNullOrWhiteSpace(i.Path) && string.Equals(Path.GetFileName(i.Path), fileName, StringComparison.OrdinalIgnoreCase)));
-                        if (existingItem is not null)
+                        if (alreadyInConfig)
                         {
-                            existingItem.OriginalDesktopPath = entryPath;
-                            if (desktopPoint.HasValue)
-                            {
-                                existingItem.DesktopX = desktopPoint.Value.X;
-                                existingItem.DesktopY = desktopPoint.Value.Y;
-                            }
+                            existingUpdates.Add(new ExistingItemMetadataUpdate(fileName, destPath, entryPath, desktopPoint));
+                            configUpdated = true;
                         }
                         continue;
                     }
@@ -177,14 +252,14 @@ public sealed class DesktopWatcher : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"Skipping '{entryPath}' during startup ingest: {ex.Message}");
+                    AppLogger.Warn($"Skipping '{entryPath}' during startup ingest: {ex.Message}");
                 }
             }
         }
 
         // If the dock currently has 0 app shortcuts and the desktop was already clear,
         // sync any unmanaged shortcuts already present in ShortcutsDirectory.
-        if (_configService.Config.Items.Count(i => !string.Equals(i.Id, MainWindow.SpecialSettingsId, StringComparison.OrdinalIgnoreCase)) == 0 &&
+        if (existingNonSettingsCount == 0 &&
             itemsToAdd.Count == 0 &&
             Directory.Exists(_configService.ShortcutsDirectory))
         {
@@ -210,22 +285,47 @@ public sealed class DesktopWatcher : IDisposable
                     }
                     catch (Exception ex)
                     {
-                        System.Diagnostics.Debug.WriteLine($"Failed to sync existing shortcut '{file}': {ex.Message}");
+                        AppLogger.Warn($"Failed to sync existing shortcut '{file}': {ex.Message}");
                     }
                 }
             }
         }
 
-        if (itemsToAdd.Count > 0)
+        if ((itemsToAdd.Count > 0 || existingUpdates.Count > 0 || capturedRbPos is not null) && !_uiDispatcher.HasShutdownStarted)
         {
             _uiDispatcher.Invoke(() =>
             {
+                if (capturedRbPos is DesktopIconPoint rb)
+                {
+                    _configService.Config.RecycleBinPosition = new SavedIconPosition { X = rb.X, Y = rb.Y };
+                }
+
+                foreach (ExistingItemMetadataUpdate upd in existingUpdates)
+                {
+                    var existingItem = _configService.Config.Items.FirstOrDefault(i =>
+                        string.Equals(i.Path, upd.DestPath, StringComparison.OrdinalIgnoreCase) ||
+                        (!string.IsNullOrWhiteSpace(i.Path) && string.Equals(Path.GetFileName(i.Path), upd.FileName, StringComparison.OrdinalIgnoreCase)));
+                    if (existingItem is not null)
+                    {
+                        existingItem.OriginalDesktopPath = upd.EntryPath;
+                        if (upd.Point.HasValue)
+                        {
+                            existingItem.DesktopX = upd.Point.Value.X;
+                            existingItem.DesktopY = upd.Point.Value.Y;
+                        }
+                    }
+                }
+
                 foreach (DockItem item in itemsToAdd)
                 {
                     AddItemIfMissing(item);
                 }
             });
-            addedAny = true;
+
+            if (itemsToAdd.Count > 0)
+            {
+                addedAny = true;
+            }
         }
 
         if (addedAny || configUpdated)
@@ -240,20 +340,23 @@ public sealed class DesktopWatcher : IDisposable
                 NotifyShellDirectoryUpdated(modDir);
             }
 
-            _ = _uiDispatcher.BeginInvoke(() => ShortcutsIngested?.Invoke(this, EventArgs.Empty));
+            if (!_uiDispatcher.HasShutdownStarted)
+            {
+                _ = _uiDispatcher.BeginInvoke(() => ShortcutsIngested?.Invoke(this, EventArgs.Empty));
+            }
         }
     }
 
-    private Dictionary<string, DesktopIconPoint> CaptureDesktopPositionsSafe()
+    private static Dictionary<string, DesktopIconPoint> CaptureDesktopPositionsSafe()
     {
         try
         {
-            return _uiDispatcher.CheckAccess()
-                ? DesktopPositionHelper.CaptureDesktopPositions()
-                : _uiDispatcher.Invoke(DesktopPositionHelper.CaptureDesktopPositions);
+            // DesktopPositionHelper.CaptureDesktopPositions already marshals onto an STA thread when called off-UI.
+            return DesktopPositionHelper.CaptureDesktopPositions();
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Warn($"CaptureDesktopPositionsSafe failed: {ex.Message}");
             return new Dictionary<string, DesktopIconPoint>(StringComparer.OrdinalIgnoreCase);
         }
     }
@@ -307,7 +410,12 @@ public sealed class DesktopWatcher : IDisposable
             return;
         }
 
-        _ = Task.Run(IngestExistingDesktopFiles);
+        AppLogger.Warn($"DesktopWatcher FileSystemWatcher error: {e.GetException().Message}");
+        _ = Task.Run(() =>
+        {
+            RestartWatchers();
+            IngestExistingDesktopFiles();
+        });
     }
 
     private void OnFileCreated(object sender, FileSystemEventArgs e)
@@ -384,8 +492,10 @@ public sealed class DesktopWatcher : IDisposable
             DesktopIconPoint? desktopPoint = null;
             try
             {
-                desktopPoint = await _uiDispatcher.InvokeAsync<DesktopIconPoint?>(() =>
-                    DesktopPositionHelper.TryGetItemPosition(sourcePath, out DesktopIconPoint pt) ? pt : null);
+                if (DesktopPositionHelper.TryGetItemPosition(sourcePath, out DesktopIconPoint pt))
+                {
+                    desktopPoint = pt;
+                }
             }
             catch
             {
@@ -394,17 +504,8 @@ public sealed class DesktopWatcher : IDisposable
 
             _configService.EnsureDirectories();
             string fileName = Path.GetFileName(sourcePath);
-            string destPath = Path.Combine(_configService.ShortcutsDirectory, fileName);
-            if (!isDirectory &&
-                !fileName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) &&
-                !fileName.EndsWith(".url", StringComparison.OrdinalIgnoreCase) &&
-                File.Exists(destPath))
-            {
-                destPath = BuildUniqueDestinationPath(_configService.ShortcutsDirectory, fileName, isDirectory);
-            }
-
-            bool moved = await TryMoveWithRetriesAsync(sourcePath, destPath, isDirectory).ConfigureAwait(false);
-            if (!moved)
+            string destPath = await TryMoveWithRetriesAsync(sourcePath, fileName, isDirectory).ConfigureAwait(false);
+            if (string.IsNullOrEmpty(destPath))
             {
                 return;
             }
@@ -413,17 +514,23 @@ public sealed class DesktopWatcher : IDisposable
 
             DockItem newItem = CreateDockItem(sourcePath, destPath, isDirectory, desktopPoint);
             newItem.Icon = _iconExtractor.GetIcon(newItem.Path);
-            await _uiDispatcher.InvokeAsync(() =>
+            if (!_uiDispatcher.HasShutdownStarted)
             {
-                AddItemIfMissing(newItem);
-            });
+                await _uiDispatcher.InvokeAsync(() =>
+                {
+                    AddItemIfMissing(newItem);
+                });
+            }
 
             await _configService.SaveAsync().ConfigureAwait(false);
 
-            _ = _uiDispatcher.BeginInvoke(() =>
+            if (!_uiDispatcher.HasShutdownStarted)
             {
-                ShortcutsIngested?.Invoke(this, EventArgs.Empty);
-            });
+                _ = _uiDispatcher.BeginInvoke(() =>
+                {
+                    ShortcutsIngested?.Invoke(this, EventArgs.Empty);
+                });
+            }
 
             // Re-flush Explorer Desktop ListView slightly later so async Shell New-Item commits (e.g. Right-Click -> New -> Text Document) cannot leave a stale ghost icon.
             _ = Task.Run(async () =>
@@ -629,51 +736,57 @@ public sealed class DesktopWatcher : IDisposable
         }
     }
 
-    private async Task<bool> TryMoveWithRetriesAsync(string sourcePath, string destPath, bool isDirectory)
+    private async Task<string> TryMoveWithRetriesAsync(string sourcePath, string fileName, bool isDirectory)
     {
         int[] retryDelaysMs = [150, 250, 400, 600, 800, 1000, 1200];
         for (int attempt = 0; attempt <= retryDelaysMs.Length; attempt++)
         {
             if (_disposed || !EntryExists(sourcePath))
             {
-                return false;
+                return string.Empty;
             }
 
             try
             {
-                MoveEntry(sourcePath, destPath, isDirectory);
-                return true;
+                lock (_moveLock)
+                {
+                    if (_disposed || !EntryExists(sourcePath))
+                    {
+                        return string.Empty;
+                    }
+
+                    string destPath = BuildUniqueDestinationPath(_configService.ShortcutsDirectory, fileName, isDirectory);
+                    MoveEntry(sourcePath, destPath, isDirectory);
+                    return destPath;
+                }
             }
             catch (UnauthorizedAccessException)
             {
-                return false;
+                return string.Empty;
             }
             catch (IOException) when (attempt < retryDelaysMs.Length)
             {
                 await Task.Delay(retryDelaysMs[attempt]).ConfigureAwait(false);
             }
-            catch (IOException)
+            catch (IOException ex)
             {
-                return false;
+                AppLogger.Warn($"Move failed after retries for '{sourcePath}': {ex.Message}");
+                return string.Empty;
             }
         }
 
-        return false;
+        return string.Empty;
     }
 
     private static void MoveEntry(string sourcePath, string destPath, bool isDirectory)
     {
         if (isDirectory)
         {
-            if (Directory.Exists(destPath))
-            {
-                Directory.Delete(destPath, recursive: true);
-            }
             Directory.Move(sourcePath, destPath);
         }
         else
         {
-            File.Move(sourcePath, destPath, overwrite: true);
+            File.Move(sourcePath, destPath, overwrite: false);
         }
     }
 
@@ -689,7 +802,7 @@ public sealed class DesktopWatcher : IDisposable
         {
             NativeMethods.SHChangeNotify(
                 isDirectory ? NativeMethods.SHCNE_RMDIR : NativeMethods.SHCNE_DELETE,
-                NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSH,
+                NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
                 itemPtr,
                 IntPtr.Zero);
         }

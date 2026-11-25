@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using Microsoft.Win32;
 
@@ -8,16 +11,16 @@ namespace CleanSlate.Core;
 
 /// <summary>
 /// Configures high-performance instant boot startup for CleanSlate via:
-/// 1. Windows Task Scheduler 2.0 COM logon task (launches at user logon with Priority 4 Normal and 0 delay,
-///    running concurrently with or before Explorer initialization, with no administrative elevation needed).
-/// 2. Explorer Startup Delay elimination (HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize\StartupDelayInMSec = 0),
-///    which disables Windows' default 10-second delay for startup applications.
-/// 3. Traditional HKCU Run registry key fallback (synchronized with single-instance mutex).
+/// 1. Windows Task Scheduler 2.0 COM logon task (via direct IDispatch without loading Microsoft.CSharp DLR),
+///    releasing all COM RCWs deterministically and skipping redundant writes if already up-to-date.
+/// 2. Explorer Startup Delay elimination (HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize\StartupDelayInMSec = 0).
+/// 3. Traditional HKCU Run registry key fallback when Task Scheduler registration fails.
 /// </summary>
 public static class WindowsStartupHelper
 {
     public const string TaskName = "CleanSlate";
     public const string StartupValueName = "CleanSlate";
+    private const string StartupArguments = "--startup";
     private const string RunRegistryPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     private const string SerializeRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize";
     private const string StartupDelayValueName = "StartupDelayInMSec";
@@ -31,18 +34,17 @@ public static class WindowsStartupHelper
 
         if (enabled)
         {
-            bool taskRegistered = RegisterLogonTask(exePath);
+            bool taskReady = IsLogonTaskConfigured(exePath, StartupArguments) || RegisterLogonTask(exePath);
             SetExplorerStartupDelayBypass(enabled: true);
 
-            if (taskRegistered)
+            if (taskReady)
             {
-                // When Task Scheduler provides zero-delay logon startup, remove the HKCU Run key
-                // so Windows Explorer does not launch a duplicate instance after boot!
+                // When Task Scheduler provides zero-delay logon startup, remove any HKCU Run duplicate.
                 SetRunRegistryKey(exePath, enabled: false);
             }
             else
             {
-                // Fallback to traditional Run registry key if Task Scheduler is unavailable
+                // Fallback to traditional Run registry key if Task Scheduler is unavailable.
                 SetRunRegistryKey(exePath, enabled: true);
             }
         }
@@ -72,77 +74,149 @@ public static class WindowsStartupHelper
         }
     }
 
-    public static bool IsLogonTaskRegistered()
+    public static bool IsLogonTaskRegistered() => IsLogonTaskConfigured(expectedExePath: null, expectedArgs: null);
+
+    private static bool IsLogonTaskConfigured(string? expectedExePath, string? expectedArgs)
     {
+        var comRefs = new List<object?>(8);
         try
         {
-            Type? schedulerType = Type.GetTypeFromProgID("Schedule.Service");
-            if (schedulerType is null)
+            object? scheduler = CreateAndConnectScheduler(comRefs);
+            if (scheduler is null)
             {
                 return false;
             }
 
-            dynamic scheduler = Activator.CreateInstance(schedulerType)!;
-            scheduler.Connect();
+            object? rootFolder = GetFolder(scheduler, @"\", comRefs);
+            if (rootFolder is null)
+            {
+                return false;
+            }
 
-            dynamic rootFolder = scheduler.GetFolder(@"\");
-            dynamic task = rootFolder.GetTask(TaskName);
-            return task is not null && task.Enabled;
+            object? task = InvokeMethod(rootFolder, "GetTask", comRefs, TaskName);
+            if (task is null)
+            {
+                return false;
+            }
+
+            if (GetProperty(task, "Enabled") is not bool isEnabled || !isEnabled)
+            {
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(expectedExePath))
+            {
+                return true;
+            }
+
+            object? definition = GetProperty(task, "Definition", comRefs);
+            object? actions = definition is null ? null : GetProperty(definition, "Actions", comRefs);
+            if (actions is null || GetProperty(actions, "Count") is not int count || count < 1)
+            {
+                return false;
+            }
+
+            object? action = GetProperty(actions, "Item", comRefs, 1);
+            if (action is null)
+            {
+                return false;
+            }
+
+            string? path = GetProperty(action, "Path") as string;
+            string? args = GetProperty(action, "Arguments") as string;
+
+            bool pathMatches = string.Equals(
+                Path.GetFullPath(path ?? string.Empty),
+                Path.GetFullPath(expectedExePath),
+                StringComparison.OrdinalIgnoreCase);
+            bool argsMatch = string.Equals(args?.Trim() ?? string.Empty, expectedArgs ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
+            return pathMatches && argsMatch;
         }
         catch
         {
             return false;
         }
+        finally
+        {
+            ReleaseAllCom(comRefs);
+        }
     }
 
     public static bool RegisterLogonTask(string exePath)
     {
+        var comRefs = new List<object?>(12);
         try
         {
-            Type? schedulerType = Type.GetTypeFromProgID("Schedule.Service");
-            if (schedulerType is null)
+            object? scheduler = CreateAndConnectScheduler(comRefs);
+            if (scheduler is null)
             {
                 return false;
             }
 
-            dynamic scheduler = Activator.CreateInstance(schedulerType)!;
-            scheduler.Connect();
+            object? rootFolder = GetFolder(scheduler, @"\", comRefs);
+            object? taskDef = InvokeMethod(scheduler, "NewTask", comRefs, 0);
+            if (rootFolder is null || taskDef is null)
+            {
+                return false;
+            }
 
-            dynamic rootFolder = scheduler.GetFolder(@"\");
-            dynamic taskDef = scheduler.NewTask(0);
-
-            taskDef.RegistrationInfo.Description = "CleanSlate Instant Startup Task (Zero Delay)";
-            taskDef.RegistrationInfo.Author = "CleanSlate";
+            object? regInfo = GetProperty(taskDef, "RegistrationInfo", comRefs);
+            if (regInfo is not null)
+            {
+                SetProperty(regInfo, "Description", "CleanSlate Instant Startup Task (Zero Delay)");
+                SetProperty(regInfo, "Author", "CleanSlate");
+            }
 
             string currentUser = WindowsIdentity.GetCurrent().Name;
-            taskDef.Principal.UserId = currentUser;
-            taskDef.Principal.LogonType = 3; // TASK_LOGON_INTERACTIVE_TOKEN
-            taskDef.Principal.RunLevel = 0;  // TASK_RUNLEVEL_LUA (Standard non-admin token)
+            object? principal = GetProperty(taskDef, "Principal", comRefs);
+            if (principal is not null)
+            {
+                SetProperty(principal, "UserId", currentUser);
+                SetProperty(principal, "LogonType", 3); // TASK_LOGON_INTERACTIVE_TOKEN
+                SetProperty(principal, "RunLevel", 0);  // TASK_RUNLEVEL_LUA
+            }
 
-            dynamic trigger = taskDef.Triggers.Create(9); // TASK_TRIGGER_LOGON
-            trigger.UserId = currentUser;
-            trigger.Delay = "PT0S"; // Zero delay
-            trigger.Enabled = true;
+            object? triggers = GetProperty(taskDef, "Triggers", comRefs);
+            object? trigger = triggers is null ? null : InvokeMethod(triggers, "Create", comRefs, 9); // TASK_TRIGGER_LOGON
+            if (trigger is not null)
+            {
+                SetProperty(trigger, "UserId", currentUser);
+                SetProperty(trigger, "Delay", "PT0S");
+                SetProperty(trigger, "Enabled", true);
+            }
 
-            dynamic action = taskDef.Actions.Create(0); // TASK_ACTION_EXEC
-            action.Path = exePath;
-            action.Arguments = "--startup";
-            action.WorkingDirectory = Path.GetDirectoryName(exePath) ?? string.Empty;
+            object? actions = GetProperty(taskDef, "Actions", comRefs);
+            object? action = actions is null ? null : InvokeMethod(actions, "Create", comRefs, 0); // TASK_ACTION_EXEC
+            if (action is null)
+            {
+                return false;
+            }
 
-            dynamic settings = taskDef.Settings;
-            settings.DisallowStartIfOnBatteries = false;
-            settings.StopIfGoingOnBatteries = false;
-            settings.ExecutionTimeLimit = "PT0S"; // Unlimited execution time
-            settings.Priority = 4; // Normal priority
+            SetProperty(action, "Path", exePath);
+            SetProperty(action, "Arguments", StartupArguments);
+            SetProperty(action, "WorkingDirectory", Path.GetDirectoryName(exePath) ?? string.Empty);
 
-            rootFolder.RegisterTaskDefinition(
+            object? settings = GetProperty(taskDef, "Settings", comRefs);
+            if (settings is not null)
+            {
+                SetProperty(settings, "DisallowStartIfOnBatteries", false);
+                SetProperty(settings, "StopIfGoingOnBatteries", false);
+                SetProperty(settings, "ExecutionTimeLimit", "PT0S");
+                SetProperty(settings, "Priority", 4);
+            }
+
+            _ = InvokeMethod(
+                rootFolder,
+                "RegisterTaskDefinition",
+                comRefs,
                 TaskName,
                 taskDef,
                 6, // TASK_CREATE_OR_UPDATE
                 null,
                 null,
-                3  // TASK_LOGON_INTERACTIVE_TOKEN
-            );
+                3); // TASK_LOGON_INTERACTIVE_TOKEN
+
             return true;
         }
         catch (Exception ex)
@@ -150,29 +224,40 @@ public static class WindowsStartupHelper
             Debug.WriteLine($"Failed to register logon task: {ex.Message}");
             return false;
         }
+        finally
+        {
+            ReleaseAllCom(comRefs);
+        }
     }
 
     public static bool UnregisterLogonTask()
     {
+        var comRefs = new List<object?>(4);
         try
         {
-            Type? schedulerType = Type.GetTypeFromProgID("Schedule.Service");
-            if (schedulerType is null)
+            object? scheduler = CreateAndConnectScheduler(comRefs);
+            if (scheduler is null)
             {
                 return false;
             }
 
-            dynamic scheduler = Activator.CreateInstance(schedulerType)!;
-            scheduler.Connect();
+            object? rootFolder = GetFolder(scheduler, @"\", comRefs);
+            if (rootFolder is null)
+            {
+                return false;
+            }
 
-            dynamic rootFolder = scheduler.GetFolder(@"\");
-            rootFolder.DeleteTask(TaskName, 0);
+            _ = InvokeMethod(rootFolder, "DeleteTask", comRefs, TaskName, 0);
             return true;
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"Failed to unregister logon task: {ex.Message}");
             return false;
+        }
+        finally
+        {
+            ReleaseAllCom(comRefs);
         }
     }
 
@@ -182,6 +267,12 @@ public static class WindowsStartupHelper
         {
             if (enabled)
             {
+                using RegistryKey? existingKey = Registry.CurrentUser.OpenSubKey(SerializeRegistryPath, writable: false);
+                if (existingKey?.GetValue(StartupDelayValueName) is int current && current == 0)
+                {
+                    return;
+                }
+
                 using RegistryKey? key = Registry.CurrentUser.CreateSubKey(SerializeRegistryPath, writable: true);
                 key?.SetValue(StartupDelayValueName, 0, RegistryValueKind.DWord);
             }
@@ -196,6 +287,15 @@ public static class WindowsStartupHelper
     {
         try
         {
+            if (!enabled)
+            {
+                using RegistryKey? readKey = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
+                if (readKey?.GetValue(StartupValueName) is null)
+                {
+                    return;
+                }
+            }
+
             using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: true)
                 ?? Registry.CurrentUser.CreateSubKey(RunRegistryPath);
 
@@ -206,7 +306,14 @@ public static class WindowsStartupHelper
 
             if (enabled)
             {
-                key.SetValue(StartupValueName, $"\"{exePath}\" --startup");
+                string desired = $"\"{exePath}\" {StartupArguments}";
+                if (key.GetValue(StartupValueName) is string current &&
+                    string.Equals(current, desired, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                key.SetValue(StartupValueName, desired);
             }
             else
             {
@@ -216,6 +323,72 @@ public static class WindowsStartupHelper
         catch (Exception ex)
         {
             Debug.WriteLine($"Failed to configure Run registry key: {ex.Message}");
+        }
+    }
+
+    private static object? CreateAndConnectScheduler(List<object?> comRefs)
+    {
+        Type? schedulerType = Type.GetTypeFromProgID("Schedule.Service");
+        if (schedulerType is null)
+        {
+            return null;
+        }
+
+        object? scheduler = Activator.CreateInstance(schedulerType);
+        if (scheduler is null)
+        {
+            return null;
+        }
+
+        comRefs.Add(scheduler);
+        _ = InvokeMethod(scheduler, "Connect", comRefs);
+        return scheduler;
+    }
+
+    private static object? GetFolder(object scheduler, string path, List<object?> comRefs) =>
+        InvokeMethod(scheduler, "GetFolder", comRefs, path);
+
+    private static object? InvokeMethod(object target, string name, List<object?> comRefs, params object?[]? args)
+    {
+        object? res = target.GetType().InvokeMember(name, BindingFlags.InvokeMethod, null, target, args);
+        if (res is not null && Marshal.IsComObject(res))
+        {
+            comRefs.Add(res);
+        }
+        return res;
+    }
+
+    private static object? GetProperty(object target, string name, List<object?>? comRefs = null, params object?[]? args)
+    {
+        object? res = target.GetType().InvokeMember(name, BindingFlags.GetProperty, null, target, args);
+        if (comRefs is not null && res is not null && Marshal.IsComObject(res))
+        {
+            comRefs.Add(res);
+        }
+        return res;
+    }
+
+    private static void SetProperty(object target, string name, object? value)
+    {
+        _ = target.GetType().InvokeMember(name, BindingFlags.SetProperty, null, target, [value]);
+    }
+
+    private static void ReleaseAllCom(List<object?> comRefs)
+    {
+        for (int i = comRefs.Count - 1; i >= 0; i--)
+        {
+            object? obj = comRefs[i];
+            if (obj is not null && Marshal.IsComObject(obj))
+            {
+                try
+                {
+                    Marshal.ReleaseComObject(obj);
+                }
+                catch
+                {
+                    // Ignore COM release errors.
+                }
+            }
         }
     }
 }

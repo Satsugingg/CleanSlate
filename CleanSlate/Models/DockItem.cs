@@ -29,6 +29,7 @@ public sealed class DockItem : INotifyPropertyChanged
     private int? _gridRow;
     private double _canvasX;
     private double _canvasY;
+    private bool _isDirectory;
 
     [JsonPropertyName("id")]
     public string Id
@@ -48,7 +49,14 @@ public sealed class DockItem : INotifyPropertyChanged
     public string Path
     {
         get => _path;
-        set => SetField(ref _path, value);
+        set
+        {
+            if (SetField(ref _path, value))
+            {
+                _isDirectory = !string.IsNullOrWhiteSpace(value) && Directory.Exists(value);
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsDirectory)));
+            }
+        }
     }
 
     [JsonPropertyName("arguments")]
@@ -160,7 +168,7 @@ public sealed class DockItem : INotifyPropertyChanged
     }
 
     [JsonIgnore]
-    public bool IsDirectory => !string.IsNullOrWhiteSpace(Path) && Directory.Exists(Path);
+    public bool IsDirectory => _isDirectory;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 

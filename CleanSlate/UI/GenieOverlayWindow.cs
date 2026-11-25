@@ -40,6 +40,7 @@ public sealed class GenieOverlayWindow : Window
     private Stopwatch? _stopwatch;
     private Action? _onCompleted;
     private bool _closedOrCancelled;
+    private bool _windowClosed;
 
     public GenieOverlayWindow(
         BitmapSource snapshot,
@@ -124,7 +125,11 @@ public sealed class GenieOverlayWindow : Window
         };
         _viewport.Children.Add(new ModelVisual3D { Content = _modelGroup });
         Content = _viewport;
-        Closed += (_, _) => ReleaseResources();
+        Closed += (_, _) =>
+        {
+            _windowClosed = true;
+            ReleaseResources();
+        };
 
         SourceInitialized += (_, _) =>
         {
@@ -151,6 +156,19 @@ public sealed class GenieOverlayWindow : Window
                 ovWidthPx,
                 ovHeightPx,
                 NativeMethods.SWP_NOACTIVATE);
+
+            if (PresentationSource.FromVisual(this)?.CompositionTarget is { } target)
+            {
+                Point topLeftDip = target.TransformFromDevice.Transform(new Point(ovLeftPx, ovTopPx));
+                Left = topLeftDip.X;
+                Top = topLeftDip.Y;
+            }
+
+            // Re-affirm target logical dimensions in case PerMonitorV2 DPI changed when moving across monitors.
+            Width = _overlayWidthDip;
+            Height = _overlayHeightDip;
+            _viewport.Width = _overlayWidthDip;
+            _viewport.Height = _overlayHeightDip;
         };
     }
 
@@ -161,6 +179,7 @@ public sealed class GenieOverlayWindow : Window
             return;
         }
 
+        _ = new WindowInteropHelper(this).EnsureHandle();
         UpdateMeshGeometry(_isOpening ? 1.0 : 0.0);
         Show();
         _stopwatch = Stopwatch.StartNew();
@@ -169,15 +188,24 @@ public sealed class GenieOverlayWindow : Window
 
     public void CancelAndClose()
     {
-        if (_closedOrCancelled)
+        if (_windowClosed)
         {
             return;
         }
 
+        _windowClosed = true;
         _closedOrCancelled = true;
         CompositionTarget.Rendering -= OnRenderingFrame;
         _onCompleted = null;
-        Close();
+        Visibility = Visibility.Hidden;
+        try
+        {
+            Close();
+        }
+        catch
+        {
+            // Ignore if already closing.
+        }
         ReleaseResources();
     }
 

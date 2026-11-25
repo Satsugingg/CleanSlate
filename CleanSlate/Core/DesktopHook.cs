@@ -24,9 +24,13 @@ public sealed class DesktopDoubleClickEventArgs : EventArgs
 /// </summary>
 public sealed class DesktopHook : IDisposable
 {
+    private const long MetricsCacheRefreshMs = 15_000;
+    private const uint CrossProcessHitTestTimeoutMs = 20;
+
     private readonly Dispatcher _uiDispatcher;
     private readonly ManualResetEventSlim _startedEvent = new(false);
     private readonly object _dockStateLock = new();
+    private readonly object _lifecycleLock = new();
     private readonly uint _currentProcessId = (uint)Environment.ProcessId;
 
     private Thread? _hookThread;
@@ -43,13 +47,19 @@ public sealed class DesktopHook : IDisposable
     private ScreenBounds _dockBounds;
     private Action? _dismissDockAction;
 
-    // Double-click tracking state (accessed exclusively on the hook thread)
+    // Double-click tracking & cached Win32 metrics (accessed exclusively on the hook thread)
     private bool _hasFirstClick;
-    private long _firstClickTimeMs;
+    private uint _firstClickMsgTimeMs;
     private NativeMethods.POINT _firstClickPt;
     private bool _pendingDoubleClick;
     private NativeMethods.POINT _secondClickDownPt;
     private long _lastTriggerTimeMs;
+
+    private uint _cachedDoubleClickTimeMs = 500;
+    private long _lastMetricsRefreshMs;
+    private IntPtr _cachedShellHwnd;
+    private uint _cachedShellPid;
+    private readonly Dictionary<IntPtr, (int MaxDx, int MaxDy, double Scale)> _monitorMetricsCache = new();
 
     public event EventHandler<DesktopDoubleClickEventArgs>? DesktopDoubleClicked;
 
@@ -75,7 +85,7 @@ public sealed class DesktopHook : IDisposable
     {
         lock (_dockStateLock)
         {
-            _isDockVisible = isVisible;
+            Volatile.Write(ref _isDockVisible, isVisible);
             _isDockAnimating = isAnimating;
             _isDockDragging = isDragging;
             _dockHwnd = dockHwnd;
@@ -85,42 +95,60 @@ public sealed class DesktopHook : IDisposable
 
     public void Start()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_hookThread is not null)
+        lock (_lifecycleLock)
         {
-            return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_hookThread is not null)
+            {
+                return;
+            }
+
+            _hookThread = new Thread(HookThreadMain)
+            {
+                Name = "CleanSlate.DesktopHook",
+                IsBackground = true
+            };
+            _lastTriggerTimeMs = Environment.TickCount64;
+            _hookThread.Start();
         }
 
-        _hookThread = new Thread(HookThreadMain)
-        {
-            Name = "CleanSlate.DesktopHook",
-            IsBackground = true
-        };
-        _lastTriggerTimeMs = Environment.TickCount64;
-        _hookThread.Start();
         _startedEvent.Wait(TimeSpan.FromSeconds(3));
     }
 
     private void HookThreadMain()
     {
-        _hookThreadId = NativeMethods.GetCurrentThreadId();
-        // Force creation of the thread message queue before signaling startup so WM_QUIT can never race.
+        uint tid = NativeMethods.GetCurrentThreadId();
+        // Force creation of the thread message queue before publishing _hookThreadId so WM_QUIT never races.
         _ = NativeMethods.PeekMessageW(out _, IntPtr.Zero, 0, 0, 0);
-        _hookProcDelegate = HookCallback;
 
-        IntPtr moduleHandle = NativeMethods.GetModuleHandleW(null);
-        _hookHandle = NativeMethods.SetWindowsHookExW(
-            NativeMethods.WH_MOUSE_LL,
-            _hookProcDelegate,
-            moduleHandle,
-            0);
+        IntPtr hookHandle = IntPtr.Zero;
+        lock (_lifecycleLock)
+        {
+            if (_disposed)
+            {
+                _startedEvent.Set();
+                return;
+            }
 
+            Volatile.Write(ref _hookThreadId, tid);
+            _hookProcDelegate = HookCallback;
+
+            IntPtr moduleHandle = NativeMethods.GetModuleHandleW(null);
+            hookHandle = NativeMethods.SetWindowsHookExW(
+                NativeMethods.WH_MOUSE_LL,
+                _hookProcDelegate,
+                moduleHandle,
+                0);
+            _hookHandle = hookHandle;
+        }
+
+        RefreshDoubleClickTimeIfNeeded();
         _startedEvent.Set();
 
-        if (_hookHandle == IntPtr.Zero)
+        if (hookHandle == IntPtr.Zero)
         {
             int error = Marshal.GetLastWin32Error();
-            System.Diagnostics.Debug.WriteLine($"SetWindowsHookExW failed with Win32 error {error} ({new Win32Exception(error).Message}).");
+            AppLogger.Warn($"SetWindowsHookExW failed with Win32 error {error} ({new Win32Exception(error).Message}).");
             return;
         }
 
@@ -134,11 +162,12 @@ public sealed class DesktopHook : IDisposable
         }
         finally
         {
-            if (_hookHandle != IntPtr.Zero)
+            IntPtr toUnhook = Interlocked.Exchange(ref _hookHandle, IntPtr.Zero);
+            if (toUnhook != IntPtr.Zero)
             {
-                NativeMethods.UnhookWindowsHookEx(_hookHandle);
-                _hookHandle = IntPtr.Zero;
+                NativeMethods.UnhookWindowsHookEx(toUnhook);
             }
+            Volatile.Write(ref _hookThreadId, 0);
         }
     }
 
@@ -147,29 +176,42 @@ public sealed class DesktopHook : IDisposable
         if (nCode >= 0)
         {
             int msg = wParam.ToInt32();
+            if (msg == NativeMethods.WM_LBUTTONDOWN ||
+                msg == NativeMethods.WM_RBUTTONDOWN ||
+                msg == NativeMethods.WM_LBUTTONUP)
+            {
+                var hookStruct = Marshal.PtrToStructure<NativeMethods.MSLLHOOKSTRUCT>(lParam);
 
-            if (msg == NativeMethods.WM_LBUTTONDOWN || msg == NativeMethods.WM_RBUTTONDOWN)
-            {
-                NativeMethods.POINT pt = ResolveCursorPoint(lParam);
-                if (TryDismissIfClickedOutsideDock(pt))
+                // Ignore synthetic / injected mouse events (auto-clickers, remote macros, UI automation).
+                if ((hookStruct.flags & (NativeMethods.LLMHF_INJECTED | NativeMethods.LLMHF_LOWER_IL_INJECTED)) == 0)
                 {
-                    _hasFirstClick = false;
-                    _pendingDoubleClick = false;
-                    return NativeMethods.CallNextHookEx(_hookHandle, nCode, wParam, lParam);
-                }
+                    NativeMethods.POINT pt = hookStruct.pt;
 
-                if (msg == NativeMethods.WM_LBUTTONDOWN)
-                {
-                    HandleLeftButtonDown(pt);
+                    if (msg == NativeMethods.WM_LBUTTONDOWN || msg == NativeMethods.WM_RBUTTONDOWN)
+                    {
+                        if (Volatile.Read(ref _isDockVisible) && TryDismissIfClickedOutsideDock(pt))
+                        {
+                            _hasFirstClick = false;
+                            _pendingDoubleClick = false;
+                            return NativeMethods.CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+                        }
+
+                        if (msg == NativeMethods.WM_LBUTTONDOWN)
+                        {
+                            HandleLeftButtonDown(pt, hookStruct.time);
+                        }
+                        else
+                        {
+                            // Right-click breaks any pending single left-click double-click sequence.
+                            _hasFirstClick = false;
+                            _pendingDoubleClick = false;
+                        }
+                    }
+                    else
+                    {
+                        HandleLeftButtonUp(pt, hookStruct.time);
+                    }
                 }
-            }
-            else if (msg == NativeMethods.WM_LBUTTONUP)
-            {
-                HandleLeftButtonUp(lParam);
-            }
-            else if (msg == NativeMethods.WM_LBUTTONDBLCLK)
-            {
-                // Intentionally handled via WM_LBUTTONDOWN + WM_LBUTTONUP tracking so a double-click never triggers twice.
             }
         }
 
@@ -243,6 +285,11 @@ public sealed class DesktopHook : IDisposable
 
     private bool IsPointInsideVisibleDock(NativeMethods.POINT pt)
     {
+        if (!Volatile.Read(ref _isDockVisible))
+        {
+            return false;
+        }
+
         lock (_dockStateLock)
         {
             if (!_isDockVisible || (!_isDockAnimating && (_dockHwnd == IntPtr.Zero || !NativeMethods.IsWindowVisible(_dockHwnd))))
@@ -260,27 +307,30 @@ public sealed class DesktopHook : IDisposable
                pt.Y >= rect.Top && pt.Y <= rect.Bottom;
     }
 
-    private void HandleLeftButtonDown(NativeMethods.POINT pt)
+    private void HandleLeftButtonDown(NativeMethods.POINT pt, uint eventTimeMs)
     {
-        if (IsPointInsideVisibleDock(pt) || !IsDesktopSurfaceAtPoint(pt))
+        if (IsPointInsideVisibleDock(pt) ||
+            !IsDesktopSurfaceAtPoint(pt, out IntPtr listViewHwnd, out uint desktopPid))
         {
             _hasFirstClick = false;
             _pendingDoubleClick = false;
             return;
         }
 
-        long nowMs = Environment.TickCount64;
-        uint maxIntervalMs = NativeMethods.GetDoubleClickTime();
-        if (maxIntervalMs == 0)
+        // Do not start or complete a dock double-click sequence if the user clicked a desktop icon/label.
+        if (listViewHwnd != IntPtr.Zero && IsPointOnDesktopIcon(pt, listViewHwnd, desktopPid))
         {
-            maxIntervalMs = 500;
+            _hasFirstClick = false;
+            _pendingDoubleClick = false;
+            return;
         }
 
-        int maxDx = Math.Max(8, NativeMethods.GetSystemMetrics(NativeMethods.SM_CXDOUBLECLK));
-        int maxDy = Math.Max(8, NativeMethods.GetSystemMetrics(NativeMethods.SM_CYDOUBLECLK));
+        uint maxIntervalMs = RefreshDoubleClickTimeIfNeeded();
+        (int maxDx, int maxDy, _) = GetDoubleClickMetricsForPoint(pt);
+        uint elapsedMs = unchecked(eventTimeMs - _firstClickMsgTimeMs);
 
         if (_hasFirstClick &&
-            (nowMs - _firstClickTimeMs) <= maxIntervalMs &&
+            elapsedMs <= maxIntervalMs &&
             Math.Abs(pt.X - _firstClickPt.X) <= maxDx &&
             Math.Abs(pt.Y - _firstClickPt.Y) <= maxDy)
         {
@@ -292,13 +342,13 @@ public sealed class DesktopHook : IDisposable
         else
         {
             _hasFirstClick = true;
-            _firstClickTimeMs = nowMs;
+            _firstClickMsgTimeMs = eventTimeMs;
             _firstClickPt = pt;
             _pendingDoubleClick = false;
         }
     }
 
-    private void HandleLeftButtonUp(IntPtr lParam)
+    private void HandleLeftButtonUp(NativeMethods.POINT upPt, uint eventTimeMs)
     {
         if (!_pendingDoubleClick)
         {
@@ -306,36 +356,79 @@ public sealed class DesktopHook : IDisposable
         }
 
         _pendingDoubleClick = false;
-        NativeMethods.POINT upPt = ResolveCursorPoint(lParam);
 
-        long nowMs = Environment.TickCount64;
-        uint maxIntervalMs = NativeMethods.GetDoubleClickTime();
-        if (maxIntervalMs == 0)
-        {
-            maxIntervalMs = 500;
-        }
+        uint maxIntervalMs = RefreshDoubleClickTimeIfNeeded();
+        uint sinceFirstClickMs = unchecked(eventTimeMs - _firstClickMsgTimeMs);
 
-        // If the click was held or mouse-up took longer than the double-click window, it was a hold/drag, not a double click.
-        if ((nowMs - _firstClickTimeMs) > (maxIntervalMs + 400))
+        // If the click was held or mouse-up took longer than the double-click window, it was a hold/drag.
+        if (sinceFirstClickMs > (maxIntervalMs + 400))
         {
             return;
         }
 
-        // Ignore marquee drag selections started immediately after a click.
-        if (Math.Abs(upPt.X - _secondClickDownPt.X) > 12 ||
-            Math.Abs(upPt.Y - _secondClickDownPt.Y) > 12)
+        // Ignore marquee drag selections started immediately after a click (DPI-aware threshold).
+        (_, _, double scale) = GetDoubleClickMetricsForPoint(upPt);
+        int dragJitterThresholdPx = Math.Max(8, (int)Math.Round(12.0 * scale));
+        if (Math.Abs(upPt.X - _secondClickDownPt.X) > dragJitterThresholdPx ||
+            Math.Abs(upPt.Y - _secondClickDownPt.Y) > dragJitterThresholdPx)
         {
             return;
         }
 
-        if (!IsDockCurrentlyActive() && IsDesktopSurfaceAtPoint(upPt))
+        if (!IsDockCurrentlyActive() &&
+            IsDesktopSurfaceAtPoint(upPt, out IntPtr listViewHwnd, out uint desktopPid) &&
+            (listViewHwnd == IntPtr.Zero || !IsPointOnDesktopIcon(upPt, listViewHwnd, desktopPid)))
         {
+            long nowMs = Environment.TickCount64;
             if ((nowMs - _lastTriggerTimeMs) >= 350)
             {
                 _lastTriggerTimeMs = nowMs;
                 RaiseDesktopDoubleClick(upPt.X, upPt.Y);
             }
         }
+    }
+
+    private uint RefreshDoubleClickTimeIfNeeded()
+    {
+        long nowMs = Environment.TickCount64;
+        if (_lastMetricsRefreshMs == 0 || (nowMs - _lastMetricsRefreshMs) >= MetricsCacheRefreshMs)
+        {
+            uint interval = NativeMethods.GetDoubleClickTime();
+            _cachedDoubleClickTimeMs = interval == 0 ? 500 : interval;
+            _lastMetricsRefreshMs = nowMs;
+            _monitorMetricsCache.Clear();
+        }
+
+        return _cachedDoubleClickTimeMs;
+    }
+
+    private (int MaxDx, int MaxDy, double Scale) GetDoubleClickMetricsForPoint(NativeMethods.POINT pt)
+    {
+        IntPtr hMonitor = NativeMethods.MonitorFromPoint(pt, NativeMethods.MONITOR_DEFAULTTONEAREST);
+        if (hMonitor != IntPtr.Zero && _monitorMetricsCache.TryGetValue(hMonitor, out var cached))
+        {
+            return cached;
+        }
+
+        uint dpiX = 96;
+        if (hMonitor != IntPtr.Zero &&
+            NativeMethods.GetDpiForMonitor(hMonitor, NativeMethods.MDT_EFFECTIVE_DPI, out uint dx, out _) == 0 &&
+            dx > 0)
+        {
+            dpiX = dx;
+        }
+
+        double scale = dpiX / 96.0;
+        int maxDx = Math.Max(8, NativeMethods.GetSystemMetricsForDpi(NativeMethods.SM_CXDOUBLECLK, dpiX));
+        int maxDy = Math.Max(8, NativeMethods.GetSystemMetricsForDpi(NativeMethods.SM_CYDOUBLECLK, dpiX));
+        var computed = (maxDx, maxDy, scale);
+
+        if (hMonitor != IntPtr.Zero)
+        {
+            _monitorMetricsCache[hMonitor] = computed;
+        }
+
+        return computed;
     }
 
     private bool IsDockCurrentlyActive()
@@ -346,59 +439,77 @@ public sealed class DesktopHook : IDisposable
         }
     }
 
-    private static NativeMethods.POINT ResolveCursorPoint(IntPtr lParam)
-    {
-        if (NativeMethods.GetCursorPos(out NativeMethods.POINT pt))
-        {
-            return pt;
-        }
-
-        return Marshal.PtrToStructure<NativeMethods.MSLLHOOKSTRUCT>(lParam).pt;
-    }
-
     private void RaiseDesktopDoubleClick(int x, int y)
     {
-        _uiDispatcher.BeginInvoke(DispatcherPriority.Normal, () =>
+        if (_uiDispatcher.HasShutdownStarted)
         {
-            DesktopDoubleClicked?.Invoke(this, new DesktopDoubleClickEventArgs(x, y));
-        });
+            return;
+        }
+
+        try
+        {
+            _ = _uiDispatcher.BeginInvoke(DispatcherPriority.Normal, () =>
+            {
+                DesktopDoubleClicked?.Invoke(this, new DesktopDoubleClickEventArgs(x, y));
+            });
+        }
+        catch
+        {
+            // Ignore dispatcher shutdown races.
+        }
     }
 
     /// <summary>
-    /// Verifies that the window under the given screen coordinates belongs exclusively to the
-    /// Windows desktop shell surface (WorkerW, Progman, SHELLDLL_DefView) and not an application,
-    /// taskbar, or File Explorer window.
+    /// Fast-path verification that <paramref name="pt"/> sits over the Windows desktop shell surface
+    /// (WorkerW, Progman, SHELLDLL_DefView) rather than an application, taskbar, or File Explorer window.
+    /// Outputs the SysListView32 handle and owning explorer PID when available for icon hit-testing.
     /// </summary>
-    private static bool IsDesktopSurfaceAtPoint(NativeMethods.POINT pt)
+    private bool IsDesktopSurfaceAtPoint(
+        NativeMethods.POINT pt,
+        out IntPtr listViewHwnd,
+        out uint desktopPid)
     {
+        listViewHwnd = IntPtr.Zero;
+        desktopPid = 0;
+
         IntPtr hwnd = NativeMethods.WindowFromPoint(pt);
         if (hwnd == IntPtr.Zero)
         {
             return false;
         }
 
+        // O(1) root fast-path: virtually all non-desktop clicks exit here without walking parents.
+        IntPtr rootHwnd = NativeMethods.GetAncestor(hwnd, NativeMethods.GA_ROOT);
+        IntPtr rootToCheck = rootHwnd != IntPtr.Zero ? rootHwnd : hwnd;
+        ReadOnlySpan<char> rootClass = NativeMethods.GetWindowClassNameSpan(rootToCheck);
+        if (!IsDesktopElementClass(rootClass))
+        {
+            return false;
+        }
+
         IntPtr desktopHwnd = NativeMethods.GetDesktopWindow();
         IntPtr current = hwnd;
-        IntPtr topLevel = hwnd;
+        IntPtr topLevel = rootToCheck;
         bool sawDesktopClass = false;
-        string topLevelClass = string.Empty;
 
-        for (int depth = 0; depth < 32 && current != IntPtr.Zero && current != desktopHwnd; depth++)
+        for (int depth = 0; depth < 16 && current != IntPtr.Zero && current != desktopHwnd; depth++)
         {
-            string className = NativeMethods.GetWindowClassName(current);
+            ReadOnlySpan<char> className = NativeMethods.GetWindowClassNameSpan(current);
             if (IsIgnoredWindowClass(className))
             {
                 return false;
             }
 
-            if (IsDesktopElementClass(className))
+            if (listViewHwnd == IntPtr.Zero && className.Equals("SysListView32", StringComparison.Ordinal))
+            {
+                listViewHwnd = current;
+            }
+            else if (IsDesktopElementClass(className))
             {
                 sawDesktopClass = true;
             }
 
             topLevel = current;
-            topLevelClass = className;
-
             IntPtr parent = NativeMethods.GetAncestor(current, NativeMethods.GA_PARENT);
             if (parent == IntPtr.Zero || parent == desktopHwnd || parent == current)
             {
@@ -413,63 +524,187 @@ public sealed class DesktopHook : IDisposable
             return false;
         }
 
-        if (!string.Equals(topLevelClass, "Progman", StringComparison.Ordinal) &&
-            !string.Equals(topLevelClass, "WorkerW", StringComparison.Ordinal) &&
-            !string.Equals(topLevelClass, "SHELLDLL_DefView", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        // Verify ownership by the shell host process (explorer.exe desktop shell) when available.
+        // Verify ownership by explorer.exe desktop shell host process.
         IntPtr shellHwnd = NativeMethods.GetShellWindow();
         if (shellHwnd != IntPtr.Zero)
         {
-            NativeMethods.GetWindowThreadProcessId(shellHwnd, out uint shellPid);
+            if (shellHwnd != _cachedShellHwnd || _cachedShellPid == 0)
+            {
+                NativeMethods.GetWindowThreadProcessId(shellHwnd, out _cachedShellPid);
+                _cachedShellHwnd = shellHwnd;
+            }
+
             NativeMethods.GetWindowThreadProcessId(topLevel, out uint targetPid);
-            if (shellPid != 0 && targetPid != shellPid)
+            if (_cachedShellPid != 0 && targetPid != _cachedShellPid)
             {
                 return false;
             }
+
+            desktopPid = targetPid;
+        }
+        else if (listViewHwnd != IntPtr.Zero)
+        {
+            NativeMethods.GetWindowThreadProcessId(listViewHwnd, out desktopPid);
         }
 
         return true;
     }
 
-    private static bool IsDesktopElementClass(string className)
+    /// <summary>
+    /// Queries Explorer's SysListView32 via SendMessageTimeout (20ms bounded) to determine whether
+    /// <paramref name="screenPt"/> lands directly on a desktop icon or label.
+    /// </summary>
+    private static bool IsPointOnDesktopIcon(
+        NativeMethods.POINT screenPt,
+        IntPtr listViewHwnd,
+        uint explorerPid)
     {
-        return string.Equals(className, "WorkerW", StringComparison.Ordinal) ||
-               string.Equals(className, "Progman", StringComparison.Ordinal) ||
-               string.Equals(className, "SHELLDLL_DefView", StringComparison.Ordinal);
+        if (listViewHwnd == IntPtr.Zero || explorerPid == 0)
+        {
+            return false;
+        }
+
+        NativeMethods.POINT clientPt = screenPt;
+        if (!NativeMethods.ScreenToClient(listViewHwnd, ref clientPt))
+        {
+            return false;
+        }
+
+        IntPtr hProcess = NativeMethods.OpenProcess(
+            NativeMethods.PROCESS_VM_OPERATION | NativeMethods.PROCESS_VM_READ | NativeMethods.PROCESS_VM_WRITE,
+            false,
+            explorerPid);
+        if (hProcess == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        int structSize = Marshal.SizeOf<NativeMethods.LVHITTESTINFO>();
+        IntPtr localMem = IntPtr.Zero;
+        IntPtr remoteMem = IntPtr.Zero;
+        try
+        {
+            localMem = Marshal.AllocHGlobal(structSize);
+            remoteMem = NativeMethods.VirtualAllocEx(
+                hProcess,
+                IntPtr.Zero,
+                (UIntPtr)structSize,
+                NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE,
+                NativeMethods.PAGE_READWRITE);
+            if (remoteMem == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var info = new NativeMethods.LVHITTESTINFO
+            {
+                pt = clientPt,
+                flags = 0,
+                iItem = -1,
+                iSubItem = 0,
+                iGroup = 0
+            };
+            Marshal.StructureToPtr(info, localMem, false);
+
+            if (!NativeMethods.WriteProcessMemory(hProcess, remoteMem, localMem, (UIntPtr)structSize, out _))
+            {
+                return false;
+            }
+
+            IntPtr sent = NativeMethods.SendMessageTimeoutW(
+                listViewHwnd,
+                NativeMethods.LVM_HITTEST,
+                IntPtr.Zero,
+                remoteMem,
+                NativeMethods.SMTO_ABORTIFHUNG | NativeMethods.SMTO_BLOCK,
+                CrossProcessHitTestTimeoutMs,
+                out IntPtr hitResult);
+
+            if (sent == IntPtr.Zero || hitResult.ToInt64() < 0)
+            {
+                return false;
+            }
+
+            if (!NativeMethods.ReadProcessMemory(hProcess, remoteMem, localMem, (UIntPtr)structSize, out _))
+            {
+                return false;
+            }
+
+            info = Marshal.PtrToStructure<NativeMethods.LVHITTESTINFO>(localMem);
+            return info.iItem >= 0 && (info.flags & NativeMethods.LVHT_ONITEM) != 0;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (remoteMem != IntPtr.Zero)
+            {
+                NativeMethods.VirtualFreeEx(hProcess, remoteMem, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            }
+            if (localMem != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(localMem);
+            }
+            NativeMethods.CloseHandle(hProcess);
+        }
     }
 
-    private static bool IsIgnoredWindowClass(string className)
+    private static bool IsDesktopElementClass(ReadOnlySpan<char> className)
     {
-        return string.Equals(className, "Shell_TrayWnd", StringComparison.Ordinal) ||
-               string.Equals(className, "Shell_SecondaryTrayWnd", StringComparison.Ordinal) ||
-               string.Equals(className, "CabinetWClass", StringComparison.Ordinal) ||
-               string.Equals(className, "ExploreWClass", StringComparison.Ordinal) ||
-               string.Equals(className, "#32770", StringComparison.Ordinal);
+        return className.Equals("WorkerW", StringComparison.Ordinal) ||
+               className.Equals("Progman", StringComparison.Ordinal) ||
+               className.Equals("SHELLDLL_DefView", StringComparison.Ordinal);
+    }
+
+    private static bool IsIgnoredWindowClass(ReadOnlySpan<char> className)
+    {
+        return className.Equals("Shell_TrayWnd", StringComparison.Ordinal) ||
+               className.Equals("Shell_SecondaryTrayWnd", StringComparison.Ordinal) ||
+               className.Equals("CabinetWClass", StringComparison.Ordinal) ||
+               className.Equals("ExploreWClass", StringComparison.Ordinal) ||
+               className.Equals("#32770", StringComparison.Ordinal);
     }
 
     public void Dispose()
     {
-        if (_disposed)
+        Thread? threadToJoin;
+        uint threadId;
+
+        lock (_lifecycleLock)
         {
-            return;
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            threadToJoin = _hookThread;
+            threadId = Volatile.Read(ref _hookThreadId);
         }
 
-        _disposed = true;
-
-        if (_hookThreadId != 0)
+        if (threadId != 0)
         {
-            NativeMethods.PostThreadMessageW(_hookThreadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+            NativeMethods.PostThreadMessageW(threadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
 
-        if (_hookThread is { IsAlive: true })
+        bool joined = true;
+        if (threadToJoin is { IsAlive: true })
         {
-            _hookThread.Join(TimeSpan.FromMilliseconds(1500));
+            joined = threadToJoin.Join(TimeSpan.FromMilliseconds(1500));
         }
 
-        _startedEvent.Dispose();
+        // Fallback unhook in the rare case the message loop did not exit within 1.5s.
+        IntPtr remainingHook = Interlocked.Exchange(ref _hookHandle, IntPtr.Zero);
+        if (remainingHook != IntPtr.Zero)
+        {
+            NativeMethods.UnhookWindowsHookEx(remainingHook);
+        }
+
+        if (joined)
+        {
+            _startedEvent.Dispose();
+        }
     }
 }

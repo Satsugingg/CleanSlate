@@ -11,14 +11,16 @@ using System.Windows.Media.Imaging;
 namespace CleanSlate.Core;
 
 /// <summary>
-/// Extracts 48x48 high-resolution shell icons for shortcuts (.lnk, .url), executables, .ico files,
-/// and Windows stock icons (such as Empty/Full Recycle Bin), freeing every HICON safely.
+/// Extracts high-resolution (up to 256x256, minimum 128x128 normalized) shell icons for shortcuts (.lnk, .url),
+/// executables, .ico files, and Windows stock icons, freeing every HICON/HBITMAP safely.
 /// </summary>
 public sealed class IconExtractor
 {
     private const string RecycleBinEmptyCacheKey = "__stock_recycle_bin_empty__";
     private const string RecycleBinFullCacheKey = "__stock_recycle_bin_full__";
-    private const int TargetIconSize = 48;
+    private const int ExtractIconSize = 256;
+    private const int MinNormalizedIconSize = 128;
+    private const int MaxNormalizedIconSize = 256;
 
     private readonly ConcurrentDictionary<string, BitmapSource> _cache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -34,14 +36,52 @@ public sealed class IconExtractor
             return cached;
         }
 
-        BitmapSource? extracted = ExtractFileBitmapSource(filePath);
+        BitmapSource? extracted = RunInSta(() => ExtractFileBitmapSource(filePath));
         if (extracted is not null)
         {
-            extracted = NormalizeIconPadding(extracted, TargetIconSize);
+            int targetSize = Math.Clamp(Math.Max(extracted.PixelWidth, extracted.PixelHeight), MinNormalizedIconSize, MaxNormalizedIconSize);
+            extracted = NormalizeIconPadding(extracted, targetSize);
             _cache[filePath] = extracted;
         }
 
         return extracted;
+    }
+
+    private static T RunInSta<T>(Func<T> func)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+        {
+            return func();
+        }
+
+        T? result = default;
+        Exception? captured = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                result = func();
+            }
+            catch (Exception ex)
+            {
+                captured = ex;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "CleanSlate.IconSta"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        if (captured is not null)
+        {
+            AppLogger.Warn($"Icon extraction error: {captured.Message}");
+            return default!;
+        }
+
+        return result!;
     }
 
     public BitmapSource? GetRecycleBinIcon(bool isFull)
@@ -71,7 +111,7 @@ public sealed class IconExtractor
         }
 
         BitmapSource? extracted = LoadCleanSlateAppIcon();
-        extracted ??= RenderVectorSettingsIcon(TargetIconSize);
+        extracted ??= RenderVectorSettingsIcon(MinNormalizedIconSize);
 
         _cache[key] = extracted;
         return extracted;
@@ -140,7 +180,7 @@ public sealed class IconExtractor
         // 3. Try main executable icon resource
         try
         {
-            string? exe = Process.GetCurrentProcess().MainModule?.FileName;
+            string? exe = Environment.ProcessPath;
             if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
             {
                 BitmapSource? fromExe = ExtractFromIconResource(exe, 0);
@@ -164,15 +204,19 @@ public sealed class IconExtractor
             return null;
         }
 
-        BitmapFrame? best = decoder.Frames.FirstOrDefault(f => f.PixelWidth == TargetIconSize && f.PixelHeight == TargetIconSize)
-            ?? decoder.Frames.OrderBy(f => Math.Abs(f.PixelWidth - TargetIconSize)).FirstOrDefault();
+        BitmapFrame? best = decoder.Frames
+            .OrderBy(f => f.PixelWidth >= MinNormalizedIconSize ? 0 : 1)
+            .ThenBy(f => f.PixelWidth >= MinNormalizedIconSize ? f.PixelWidth : -f.PixelWidth)
+            .ThenByDescending(f => f.Format.BitsPerPixel)
+            .FirstOrDefault();
 
         if (best is null)
         {
             return null;
         }
 
-        if (best.PixelWidth == TargetIconSize && best.PixelHeight == TargetIconSize)
+        if (best.PixelWidth >= MinNormalizedIconSize && best.PixelWidth <= MaxNormalizedIconSize &&
+            best.PixelHeight >= MinNormalizedIconSize && best.PixelHeight <= MaxNormalizedIconSize)
         {
             if (!best.IsFrozen && best.CanFreeze)
             {
@@ -181,7 +225,10 @@ public sealed class IconExtractor
             return best;
         }
 
-        double scale = (double)TargetIconSize / best.PixelWidth;
+        int targetPx = best.PixelWidth > MaxNormalizedIconSize || best.PixelHeight > MaxNormalizedIconSize
+            ? MaxNormalizedIconSize
+            : MinNormalizedIconSize;
+        double scale = (double)targetPx / Math.Max(best.PixelWidth, best.PixelHeight);
         var transformed = new TransformedBitmap(best, new System.Windows.Media.ScaleTransform(scale, scale));
         var wb = new WriteableBitmap(transformed);
         wb.Freeze();
@@ -242,15 +289,17 @@ public sealed class IconExtractor
         try
         {
             BitmapSource formattedSource = source;
-            if (source.Format != System.Windows.Media.PixelFormats.Bgra32 &&
-                source.Format != System.Windows.Media.PixelFormats.Pbgra32)
+            if (source.Format != System.Windows.Media.PixelFormats.Pbgra32)
             {
-                formattedSource = new FormatConvertedBitmap(source, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+                formattedSource = new FormatConvertedBitmap(source, System.Windows.Media.PixelFormats.Pbgra32, null, 0);
+                if (formattedSource.CanFreeze)
+                {
+                    formattedSource.Freeze();
+                }
             }
 
-            var wb = new WriteableBitmap(formattedSource);
-            int w = wb.PixelWidth;
-            int h = wb.PixelHeight;
+            int w = formattedSource.PixelWidth;
+            int h = formattedSource.PixelHeight;
             if (w <= 0 || h <= 0)
             {
                 return source;
@@ -258,7 +307,7 @@ public sealed class IconExtractor
 
             int stride = w * 4;
             byte[] pixels = new byte[h * stride];
-            wb.CopyPixels(pixels, stride, 0);
+            formattedSource.CopyPixels(pixels, stride, 0);
 
             int minX = w, minY = h, maxX = -1, maxY = -1;
             for (int y = 0; y < h; y++)
@@ -289,28 +338,60 @@ public sealed class IconExtractor
             double fillRatioY = (double)contentH / h;
 
             // If an extracted icon has significant transparent padding (content occupies < 75% in both dimensions),
-            // crop the content and upscale it smoothly to fill the target tile size.
-            if (fillRatioX < 0.75 && fillRatioY < 0.75 && contentW >= 6 && contentH >= 6)
+            // crop and scale using WIC (CroppedBitmap + TransformedBitmap) at >= 128x128 density for sharp rendering at all DPIs.
+            int outputSize = Math.Clamp(targetSize, MinNormalizedIconSize, MaxNormalizedIconSize);
+            if (fillRatioX < 0.82 && fillRatioY < 0.82 && contentW >= 6 && contentH >= 6)
             {
-                var cropped = new CroppedBitmap(wb, new Int32Rect(minX, minY, contentW, contentH));
+                var cropped = new CroppedBitmap(formattedSource, new Int32Rect(minX, minY, contentW, contentH));
+                cropped.Freeze();
 
-                double destSize = targetSize - 4.0;
+                double destSize = outputSize - Math.Round(outputSize * 0.08);
                 double scale = Math.Min(destSize / contentW, destSize / contentH);
-                double scaledW = Math.Round(contentW * scale);
-                double scaledH = Math.Round(contentH * scale);
-                double offsetX = Math.Round((targetSize - scaledW) / 2.0);
-                double offsetY = Math.Round((targetSize - scaledH) / 2.0);
+                var transformed = new TransformedBitmap(cropped, new System.Windows.Media.ScaleTransform(scale, scale));
+                transformed.Freeze();
 
-                var dv = new System.Windows.Media.DrawingVisual();
-                using (var dc = dv.RenderOpen())
+                int scaledW = transformed.PixelWidth;
+                int scaledH = transformed.PixelHeight;
+                int offsetX = Math.Max(0, (outputSize - scaledW) / 2);
+                int offsetY = Math.Max(0, (outputSize - scaledH) / 2);
+
+                int scaledStride = scaledW * 4;
+                byte[] scaledPixels = new byte[scaledH * scaledStride];
+                transformed.CopyPixels(scaledPixels, scaledStride, 0);
+
+                int destStride = outputSize * 4;
+                byte[] destPixels = new byte[outputSize * destStride];
+                int copyW = Math.Min(scaledW, outputSize - offsetX);
+                int copyH = Math.Min(scaledH, outputSize - offsetY);
+
+                for (int y = 0; y < copyH; y++)
                 {
-                    dc.DrawImage(cropped, new Rect(offsetX, offsetY, scaledW, scaledH));
+                    Buffer.BlockCopy(
+                        scaledPixels,
+                        y * scaledStride,
+                        destPixels,
+                        ((offsetY + y) * destStride) + (offsetX * 4),
+                        copyW * 4);
                 }
 
-                var outputRtb = new RenderTargetBitmap(targetSize, targetSize, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
-                outputRtb.Render(dv);
-                outputRtb.Freeze();
-                return outputRtb;
+                BitmapSource resampled = BitmapSource.Create(
+                    outputSize,
+                    outputSize,
+                    96,
+                    96,
+                    System.Windows.Media.PixelFormats.Pbgra32,
+                    null,
+                    destPixels,
+                    destStride);
+                resampled.Freeze();
+                return resampled;
+            }
+            else if (w < outputSize || h < outputSize)
+            {
+                double scale = (double)outputSize / Math.Max(w, h);
+                var upscaled = new TransformedBitmap(formattedSource, new System.Windows.Media.ScaleTransform(scale, scale));
+                upscaled.Freeze();
+                return upscaled;
             }
         }
         catch
@@ -337,8 +418,13 @@ public sealed class IconExtractor
             {
                 if (File.Exists(urlIconFile))
                 {
-                    BitmapSource? directUrl = ExtractViaShellItemImageFactory(urlIconFile, TargetIconSize);
-                    directUrl ??= ExtractFromIconResource(urlIconFile, urlIconIndex);
+                    bool isDirectIco = urlIconIndex == 0 &&
+                        string.Equals(Path.GetExtension(urlIconFile), ".ico", StringComparison.OrdinalIgnoreCase);
+
+                    BitmapSource? directUrl = isDirectIco
+                        ? (ExtractFromIconResource(urlIconFile, urlIconIndex) ?? ExtractViaShellItemImageFactory(urlIconFile, ExtractIconSize))
+                        : (ExtractViaShellItemImageFactory(urlIconFile, ExtractIconSize) ?? ExtractFromIconResource(urlIconFile, urlIconIndex));
+
                     if (directUrl is not null)
                     {
                         return directUrl;
@@ -347,7 +433,7 @@ public sealed class IconExtractor
             }
 
             // Fall back to extracting from the .url file itself
-            BitmapSource? fromUrlFile = ExtractViaShellItemImageFactory(filePath, TargetIconSize);
+            BitmapSource? fromUrlFile = ExtractViaShellItemImageFactory(filePath, ExtractIconSize);
             if (fromUrlFile is not null)
             {
                 return fromUrlFile;
@@ -379,7 +465,7 @@ public sealed class IconExtractor
 
                 if (!string.IsNullOrWhiteSpace(aumidCandidate))
                 {
-                    BitmapSource? fromAumid = ExtractViaShellItemImageFactory(aumidCandidate, TargetIconSize);
+                    BitmapSource? fromAumid = ExtractViaShellItemImageFactory(aumidCandidate, ExtractIconSize);
                     if (fromAumid is not null)
                     {
                         return fromAumid;
@@ -389,8 +475,13 @@ public sealed class IconExtractor
                 // B. If an explicit IconFile was specified AND exists on disk, extract from it
                 if (!string.IsNullOrWhiteSpace(lnkIconFile) && File.Exists(lnkIconFile))
                 {
-                    BitmapSource? directLnkIcon = ExtractViaShellItemImageFactory(lnkIconFile, TargetIconSize);
-                    directLnkIcon ??= ExtractFromIconResource(lnkIconFile, lnkIconIndex);
+                    bool isDirectIco = lnkIconIndex == 0 &&
+                        string.Equals(Path.GetExtension(lnkIconFile), ".ico", StringComparison.OrdinalIgnoreCase);
+
+                    BitmapSource? directLnkIcon = isDirectIco
+                        ? (ExtractFromIconResource(lnkIconFile, lnkIconIndex) ?? ExtractViaShellItemImageFactory(lnkIconFile, ExtractIconSize))
+                        : (ExtractViaShellItemImageFactory(lnkIconFile, ExtractIconSize) ?? ExtractFromIconResource(lnkIconFile, lnkIconIndex));
+
                     if (directLnkIcon is not null)
                     {
                         return directLnkIcon;
@@ -402,7 +493,7 @@ public sealed class IconExtractor
                 {
                     if (!lnkTargetPath.EndsWith("explorer.exe", StringComparison.OrdinalIgnoreCase))
                     {
-                        BitmapSource? fromTarget = ExtractViaShellItemImageFactory(lnkTargetPath, TargetIconSize);
+                        BitmapSource? fromTarget = ExtractViaShellItemImageFactory(lnkTargetPath, ExtractIconSize);
                         fromTarget ??= ExtractFromIconResource(lnkTargetPath, 0);
                         if (fromTarget is not null)
                         {
@@ -415,7 +506,7 @@ public sealed class IconExtractor
             // D. Try extracting from the .lnk directly (only if IconLocation wasn't pointing to a missing/deleted file)
             if (string.IsNullOrWhiteSpace(lnkIconFile) || File.Exists(lnkIconFile))
             {
-                BitmapSource? lnkShell = ExtractViaShellItemImageFactory(filePath, TargetIconSize);
+                BitmapSource? lnkShell = ExtractViaShellItemImageFactory(filePath, ExtractIconSize);
                 if (lnkShell is not null)
                 {
                     return lnkShell;
@@ -424,7 +515,7 @@ public sealed class IconExtractor
         }
 
         // 3. General shell extraction via IShellItemImageFactory for executables, documents, folders, or other files
-        BitmapSource? shellItemIcon = ExtractViaShellItemImageFactory(filePath, TargetIconSize);
+        BitmapSource? shellItemIcon = ExtractViaShellItemImageFactory(filePath, ExtractIconSize);
         if (shellItemIcon is not null)
         {
             return shellItemIcon;
@@ -434,7 +525,7 @@ public sealed class IconExtractor
         return ExtractViaShellGetFileInfo(filePath);
     }
 
-    private static BitmapSource? ExtractViaShellItemImageFactory(string parsingName, int targetSize = TargetIconSize)
+    private static BitmapSource? ExtractViaShellItemImageFactory(string parsingName, int targetSize = ExtractIconSize)
     {
         if (string.IsNullOrWhiteSpace(parsingName))
         {
@@ -456,6 +547,11 @@ public sealed class IconExtractor
             hr = factory.GetImage(size, NativeMethods.SIIGBF_ICONONLY, out hBitmap);
             if (hr != 0 || hBitmap == IntPtr.Zero)
             {
+                if (hBitmap != IntPtr.Zero)
+                {
+                    NativeMethods.DeleteObject(hBitmap);
+                    hBitmap = IntPtr.Zero;
+                }
                 hr = factory.GetImage(size, NativeMethods.SIIGBF_RESIZETOFIT, out hBitmap);
             }
 
@@ -466,6 +562,43 @@ public sealed class IconExtractor
                     IntPtr.Zero,
                     Int32Rect.Empty,
                     BitmapSizeOptions.FromEmptyOptions());
+
+                // CreateBitmapSourceFromHBitmap tags 32bpp ARGB shell HBITMAPs as Bgr32 (dropping the alpha channel).
+                // Re-wrap the raw bytes as Pbgra32 when non-zero alpha bytes are present so padding detection works accurately.
+                if (source.Format == System.Windows.Media.PixelFormats.Bgr32)
+                {
+                    int w = source.PixelWidth;
+                    int h = source.PixelHeight;
+                    int stride = w * 4;
+                    byte[] pixels = new byte[h * stride];
+                    source.CopyPixels(pixels, stride, 0);
+
+                    bool hasAlpha = false;
+                    for (int i = 3; i < pixels.Length; i += 4)
+                    {
+                        if (pixels[i] != 0)
+                        {
+                            hasAlpha = true;
+                            break;
+                        }
+                    }
+
+                    if (hasAlpha)
+                    {
+                        BitmapSource alphaFixed = BitmapSource.Create(
+                            w,
+                            h,
+                            96,
+                            96,
+                            System.Windows.Media.PixelFormats.Pbgra32,
+                            null,
+                            pixels,
+                            stride);
+                        alphaFixed.Freeze();
+                        return alphaFixed;
+                    }
+                }
+
                 source.Freeze();
                 return source;
             }
@@ -497,7 +630,7 @@ public sealed class IconExtractor
             return null;
         }
 
-        // Pure managed .ico decoding when index == 0 preserves multi-resolution 48x48/256x256 PNG/RGBA frames cleanly.
+        // Pure managed .ico decoding when index == 0 preserves multi-resolution 128x128/256x256 PNG/RGBA frames cleanly.
         if (iconIndex == 0 &&
             string.Equals(Path.GetExtension(iconFile), ".ico", StringComparison.OrdinalIgnoreCase))
         {
@@ -508,16 +641,15 @@ public sealed class IconExtractor
                 if (decoder.Frames.Count > 0)
                 {
                     BitmapFrame bestFrame = decoder.Frames
-                        .OrderBy(f => f.PixelWidth >= TargetIconSize ? 0 : 1)
-                        .ThenBy(f => f.PixelWidth >= TargetIconSize ? f.PixelWidth : -f.PixelWidth)
+                        .OrderBy(f => f.PixelWidth >= MinNormalizedIconSize ? 0 : 1)
+                        .ThenBy(f => f.PixelWidth >= MinNormalizedIconSize ? f.PixelWidth : -f.PixelWidth)
                         .ThenByDescending(f => f.Format.BitsPerPixel)
                         .First();
 
-                    const int maxCachedIconPx = 96;
                     BitmapSource normalized = bestFrame;
-                    if (bestFrame.PixelWidth > maxCachedIconPx || bestFrame.PixelHeight > maxCachedIconPx)
+                    if (bestFrame.PixelWidth > MaxNormalizedIconSize || bestFrame.PixelHeight > MaxNormalizedIconSize)
                     {
-                        double factor = maxCachedIconPx / (double)Math.Max(bestFrame.PixelWidth, bestFrame.PixelHeight);
+                        double factor = MaxNormalizedIconSize / (double)Math.Max(bestFrame.PixelWidth, bestFrame.PixelHeight);
                         normalized = new TransformedBitmap(
                             bestFrame,
                             new System.Windows.Media.ScaleTransform(factor, factor));
@@ -538,7 +670,7 @@ public sealed class IconExtractor
         IntPtr hSmall = IntPtr.Zero;
         try
         {
-            uint sizes = (uint)((TargetIconSize & 0xFFFF) | (16 << 16));
+            uint sizes = (uint)((ExtractIconSize & 0xFFFF) | (48 << 16));
             int hr = NativeMethods.SHDefExtractIconW(iconFile, iconIndex, 0, out hLarge, out hSmall, sizes);
             if (hr == 0 && hLarge != IntPtr.Zero)
             {
@@ -763,11 +895,22 @@ public sealed class IconExtractor
 
     private static IntPtr ExtractExtraLargeIconByIndex(int systemIconIndex)
     {
+        IntPtr hIcon = TryGetIconFromImageList(NativeMethods.SHIL_JUMBO, systemIconIndex);
+        if (hIcon != IntPtr.Zero)
+        {
+            return hIcon;
+        }
+
+        return TryGetIconFromImageList(NativeMethods.SHIL_EXTRALARGE, systemIconIndex);
+    }
+
+    private static IntPtr TryGetIconFromImageList(int imageListFlag, int systemIconIndex)
+    {
         NativeMethods.IImageList? imageList = null;
         try
         {
             Guid iid = NativeMethods.IID_IImageList;
-            int hr = NativeMethods.SHGetImageList(NativeMethods.SHIL_EXTRALARGE, ref iid, out imageList);
+            int hr = NativeMethods.SHGetImageList(imageListFlag, ref iid, out imageList);
             if (hr != 0 || imageList is null)
             {
                 return IntPtr.Zero;

@@ -21,7 +21,27 @@ internal static class NativeMethods
     public const int WM_QUIT = 0x0012;
     public const int WM_USER = 0x0400;
     public const int WM_HOTKEY = 0x0312;
+    public const int LVM_HITTEST = 0x1012;
     public const int LVM_GETEDITCONTROL = 0x1018;
+
+    public const uint LLMHF_INJECTED = 0x00000001;
+    public const uint LLMHF_LOWER_IL_INJECTED = 0x00000002;
+
+    public const uint SMTO_BLOCK = 0x0001;
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    public const uint LVHT_ONITEMICON = 0x0002;
+    public const uint LVHT_ONITEMLABEL = 0x0004;
+    public const uint LVHT_ONITEMSTATEICON = 0x0008;
+    public const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
+
+    public const uint PROCESS_VM_OPERATION = 0x0008;
+    public const uint PROCESS_VM_READ = 0x0010;
+    public const uint PROCESS_VM_WRITE = 0x0020;
+    public const uint MEM_COMMIT = 0x1000;
+    public const uint MEM_RESERVE = 0x2000;
+    public const uint MEM_RELEASE = 0x8000;
+    public const uint PAGE_READWRITE = 0x04;
 
     public const uint GA_PARENT = 1;
     public const uint GA_ROOT = 2;
@@ -60,6 +80,7 @@ internal static class NativeMethods
     public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
 
     public const int SHIL_EXTRALARGE = 0x2; // 48x48
+    public const int SHIL_JUMBO = 0x4;      // 256x256
     public const int ILD_TRANSPARENT = 0x00000001;
 
     public const uint SHGSI_ICON = 0x000000100;
@@ -80,6 +101,12 @@ internal static class NativeMethods
     public const uint SHERB_NOCONFIRMATION = 0x00000001;
     public const uint SHERB_NOPROGRESSUI = 0x00000002;
     public const uint SHERB_NOSOUND = 0x00000004;
+
+    public const uint FO_DELETE = 0x0003;
+    public const ushort FOF_SILENT = 0x0004;
+    public const ushort FOF_NOCONFIRMATION = 0x0010;
+    public const ushort FOF_ALLOWUNDO = 0x0040;
+    public const ushort FOF_NOERRORUI = 0x0400;
 
     public static readonly Guid IID_IImageList = new("46EB5926-582E-4017-9FDF-E8998DAA0950");
     public static readonly Guid IID_IShellItemImageFactory = new("bcc18b79-ba16-442f-80c4-8a59c30c463b");
@@ -160,6 +187,16 @@ internal static class NativeMethods
         public uint flags;
         public uint time;
         public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LVHITTESTINFO
+    {
+        public POINT pt;
+        public uint flags;
+        public int iItem;
+        public int iSubItem;
+        public int iGroup;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -345,6 +382,16 @@ internal static class NativeMethods
     public static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("user32.dll")]
+    public static extern int GetSystemMetricsForDpi(int nIndex, uint dpi);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -406,6 +453,16 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessageW(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeoutW(
+        IntPtr hWnd,
+        uint Msg,
+        IntPtr wParam,
+        IntPtr lParam,
+        uint fuFlags,
+        uint uTimeout,
+        out IntPtr lpdwResult);
 
     public static bool IsDesktopInlineEditActive()
     {
@@ -474,6 +531,28 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
     // --- shcore.dll ---
     [DllImport("shcore.dll")]
     public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
@@ -503,6 +582,52 @@ internal static class NativeMethods
 
     [DllImport("shell32.dll")]
     public static extern void SHChangeNotify(uint wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SHFILEOPSTRUCTW
+    {
+        public IntPtr hwnd;
+        public uint wFunc;
+        public IntPtr pFrom;
+        public IntPtr pTo;
+        public ushort fFlags;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool fAnyOperationsAborted;
+        public IntPtr hNameMappings;
+        public IntPtr lpszProgressTitle;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern int SHFileOperationW(ref SHFILEOPSTRUCTW FileOp);
+
+    public static bool SendToRecycleBinSilent(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        // SHFILEOPSTRUCTW requires double-null-terminated pFrom string in unmanaged memory.
+        IntPtr pFrom = Marshal.StringToHGlobalUni(path + "\0");
+        try
+        {
+            var op = new SHFILEOPSTRUCTW
+            {
+                hwnd = IntPtr.Zero,
+                wFunc = FO_DELETE,
+                pFrom = pFrom,
+                pTo = IntPtr.Zero,
+                fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+            };
+
+            int result = SHFileOperationW(ref op);
+            return result == 0 && !op.fAnyOperationsAborted;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pFrom);
+        }
+    }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     public static extern int SHEmptyRecycleBinW(IntPtr hwnd, string? pszRootPath, uint dwFlags);
@@ -680,16 +805,22 @@ internal static class NativeMethods
     [ThreadStatic]
     private static char[]? s_classNameBuffer;
 
-    public static string GetWindowClassName(IntPtr hwnd)
+    public static ReadOnlySpan<char> GetWindowClassNameSpan(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero)
         {
-            return string.Empty;
+            return ReadOnlySpan<char>.Empty;
         }
 
         s_classNameBuffer ??= new char[256];
         int length = GetClassNameW(hwnd, s_classNameBuffer, s_classNameBuffer.Length);
-        return length > 0 ? new string(s_classNameBuffer, 0, length) : string.Empty;
+        return length > 0 ? s_classNameBuffer.AsSpan(0, length) : ReadOnlySpan<char>.Empty;
+    }
+
+    public static string GetWindowClassName(IntPtr hwnd)
+    {
+        ReadOnlySpan<char> span = GetWindowClassNameSpan(hwnd);
+        return span.Length > 0 ? new string(span) : string.Empty;
     }
 
     /// <summary>

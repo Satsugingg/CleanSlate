@@ -26,7 +26,7 @@ public sealed class TrayIconManager : IDisposable
     private readonly Action _openRecycleBinAction;
     private readonly Action _syncSettingsAction;
     private readonly Action _exitAction;
-    private readonly TrayMenuWindow _menuWindow;
+    private TrayMenuWindow? _menuWindow;
 
     private HwndSource? _hwndSource;
     private IntPtr _iconHandle;
@@ -37,6 +37,7 @@ public sealed class TrayIconManager : IDisposable
     private bool _hotkeyRegistered;
     private bool _iconAdded;
     private bool _disposed;
+    private long _lastTraySummonTickMs;
 
     public TrayIconManager(
         ConfigService configService,
@@ -52,14 +53,24 @@ public sealed class TrayIconManager : IDisposable
         _openRecycleBinAction = openRecycleBinAction ?? DefaultOpenRecycleBin;
         _syncSettingsAction = syncSettingsAction ?? throw new ArgumentNullException(nameof(syncSettingsAction));
         _exitAction = exitAction ?? throw new ArgumentNullException(nameof(exitAction));
+    }
 
-        _menuWindow = new TrayMenuWindow();
-        _menuWindow.OpenCleanSlateRequested += (_, _) => _openDockAction();
-        _menuWindow.OpenRecycleBinRequested += (_, _) => _openRecycleBinAction();
-        _menuWindow.OpenShortcutsFolderRequested += (_, _) => OpenShortcutsFolder();
-        _menuWindow.OpenSettingsRequested += (_, _) => LaunchSettingsApp();
-        _menuWindow.ToggleStartupRequested += (_, _) => _configService.ToggleWindowsStartup();
-        _menuWindow.ExitRequested += (_, _) => _exitAction();
+    private TrayMenuWindow EnsureMenuWindow()
+    {
+        if (_menuWindow is not null)
+        {
+            return _menuWindow;
+        }
+
+        var menu = new TrayMenuWindow();
+        menu.OpenCleanSlateRequested += (_, _) => _openDockAction();
+        menu.OpenRecycleBinRequested += (_, _) => _openRecycleBinAction();
+        menu.OpenShortcutsFolderRequested += (_, _) => OpenShortcutsFolder();
+        menu.OpenSettingsRequested += (_, _) => LaunchSettingsApp();
+        menu.ToggleStartupRequested += (_, _) => _configService.ToggleWindowsStartup();
+        menu.ExitRequested += (_, _) => _exitAction();
+        _menuWindow = menu;
+        return menu;
     }
 
     public void Initialize()
@@ -126,14 +137,14 @@ public sealed class TrayIconManager : IDisposable
     {
         try
         {
-            Process.Start(new ProcessStartInfo("explorer.exe", "shell:RecycleBinFolder")
+            using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", "shell:RecycleBinFolder")
             {
                 UseShellExecute = true
             });
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to open Recycle Bin: {ex.Message}");
+            AppLogger.Warn($"Failed to open Recycle Bin: {ex.Message}");
         }
     }
 
@@ -160,29 +171,33 @@ public sealed class TrayIconManager : IDisposable
             if (streamInfo is not null)
             {
                 string tempIco = Path.Combine(Path.GetTempPath(), $"CleanSlate_{Environment.ProcessId}.ico");
-                using (streamInfo.Stream)
-                using (FileStream fs = File.Create(tempIco))
+                try
                 {
-                    streamInfo.Stream.CopyTo(fs);
+                    using (streamInfo.Stream)
+                    using (FileStream fs = File.Create(tempIco))
+                    {
+                        streamInfo.Stream.CopyTo(fs);
+                    }
+
+                    int cx = NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSMICON);
+                    int cy = NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSMICON);
+                    return NativeMethods.LoadImageW(
+                        IntPtr.Zero,
+                        tempIco,
+                        NativeMethods.IMAGE_ICON,
+                        cx > 0 ? cx : 16,
+                        cy > 0 ? cy : 16,
+                        NativeMethods.LR_LOADFROMFILE);
                 }
-
-                int cx = NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSMICON);
-                int cy = NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSMICON);
-                IntPtr hIcon = NativeMethods.LoadImageW(
-                    IntPtr.Zero,
-                    tempIco,
-                    NativeMethods.IMAGE_ICON,
-                    cx > 0 ? cx : 16,
-                    cy > 0 ? cy : 16,
-                    NativeMethods.LR_LOADFROMFILE);
-
-                try { File.Delete(tempIco); } catch { }
-                return hIcon;
+                finally
+                {
+                    try { File.Delete(tempIco); } catch { }
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore resource extraction failure.
+            AppLogger.Warn($"LoadTrayIconHandle fallback failed: {ex.Message}");
         }
 
         return IntPtr.Zero;
@@ -261,12 +276,17 @@ public sealed class TrayIconManager : IDisposable
             return IntPtr.Zero;
         }
 
-        if (uMsg == WmTrayCallback)
+        if (uMsg == WmTrayCallback && (uint)wParam.ToInt64() == TrayIconId)
         {
             int mouseMsg = lParam.ToInt32() & 0xFFFF;
             if (mouseMsg == NativeMethods.WM_LBUTTONUP || mouseMsg == NativeMethods.WM_LBUTTONDBLCLK)
             {
-                _openDockAction();
+                long nowMs = Environment.TickCount64;
+                if ((nowMs - _lastTraySummonTickMs) >= 250)
+                {
+                    _lastTraySummonTickMs = nowMs;
+                    _openDockAction();
+                }
                 handled = true;
             }
             else if (mouseMsg == NativeMethods.WM_RBUTTONUP || mouseMsg == NativeMethods.WM_CONTEXTMENU)
@@ -291,7 +311,7 @@ public sealed class TrayIconManager : IDisposable
             return;
         }
 
-        _menuWindow.ShowAtCursor(pt.X, pt.Y, _configService.IsWindowsStartupEnabled());
+        EnsureMenuWindow().ShowAtCursor(pt.X, pt.Y, _configService.IsWindowsStartupEnabled());
     }
 
     private void OpenShortcutsFolder()
@@ -299,14 +319,14 @@ public sealed class TrayIconManager : IDisposable
         try
         {
             _configService.EnsureDirectories();
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_configService.ShortcutsDirectory}\"")
+            using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_configService.ShortcutsDirectory}\"")
             {
                 UseShellExecute = true
             });
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to open shortcuts folder: {ex.Message}");
+            AppLogger.Warn($"Failed to open shortcuts folder: {ex.Message}");
         }
     }
 
@@ -325,14 +345,14 @@ public sealed class TrayIconManager : IDisposable
                 return;
             }
 
-            Process.Start(new ProcessStartInfo(settingsPath)
+            using Process? proc = Process.Start(new ProcessStartInfo(settingsPath)
             {
                 UseShellExecute = true
             });
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to launch CleanSlate.Settings.exe: {ex.Message}");
+            AppLogger.Warn($"Failed to launch CleanSlate.Settings.exe: {ex.Message}");
         }
     }
 
@@ -405,7 +425,11 @@ public sealed class TrayIconManager : IDisposable
             _hwndSource = null;
         }
 
-        _menuWindow.AllowClose = true;
-        _menuWindow.Close();
+        if (_menuWindow is not null)
+        {
+            _menuWindow.AllowClose = true;
+            _menuWindow.Close();
+            _menuWindow = null;
+        }
     }
 }

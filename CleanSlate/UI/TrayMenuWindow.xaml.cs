@@ -103,6 +103,13 @@ public partial class TrayMenuWindow : Window
             physH,
             NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
 
+        if (PresentationSource.FromVisual(this)?.CompositionTarget is { } finalTarget)
+        {
+            Point finalDip = finalTarget.TransformFromDevice.Transform(new Point(targetX, targetY));
+            Left = finalDip.X;
+            Top = finalDip.Y;
+        }
+
         NativeMethods.ForceForegroundWindow(hwnd);
         Activate();
     }

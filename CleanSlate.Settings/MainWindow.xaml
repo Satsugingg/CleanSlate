@@ -711,6 +711,44 @@
                                     Click="OnResetDesktopIconsClick" />
                         </Grid>
                     </Border>
+
+                    <Border Style="{StaticResource RowDividerStyle}" />
+
+                    <!-- Check for Updates -->
+                    <Border Style="{StaticResource SettingRowStyle}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Margin="0,0,12,0">
+                                <TextBlock Text="Software Updates"
+                                           FontSize="13.5"
+                                           FontWeight="SemiBold"
+                                           Foreground="#F0FFFFFF" />
+                                <TextBlock x:Name="UpdateStatusText"
+                                           Text="Installed version: v1.1.0"
+                                           FontSize="11.5"
+                                           Foreground="#7AFFFFFF"
+                                           TextWrapping="Wrap"
+                                           Margin="0,2,0,0" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1"
+                                        Orientation="Horizontal"
+                                        VerticalAlignment="Center">
+                                <Button x:Name="InstallUpdateButton"
+                                        Content="Install Update"
+                                        Style="{StaticResource ActionButtonStyle}"
+                                        Visibility="Collapsed"
+                                        Margin="0,0,8,0"
+                                        Click="OnInstallUpdateClick" />
+                                <Button x:Name="CheckUpdatesButton"
+                                        Content="Check for Updates"
+                                        Style="{StaticResource ActionButtonStyle}"
+                                        Click="OnCheckForUpdatesClick" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
                 </StackPanel>
             </Border>
         </StackPanel>

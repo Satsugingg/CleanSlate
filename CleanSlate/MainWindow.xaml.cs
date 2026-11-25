@@ -19,7 +19,6 @@ using CleanSlate.Core;
 using CleanSlate.Models;
 using CleanSlate.Services;
 using CleanSlate.UI;
-using Microsoft.VisualBasic.FileIO;
 
 namespace CleanSlate;
 
@@ -63,12 +62,9 @@ public partial class MainWindow : Window
         double CellStepX,
         double CellStepY);
 
-    private static readonly Brush FrostedBackgroundBrush = CreateFrozenBrush(0xE6, 0x18, 0x18, 0x18);
-    private static readonly Brush FrostedBorderBrush = CreateFrozenBrush(0x10, 0xFF, 0xFF, 0xFF);
     private static readonly Brush HitTestTransparentBrush = CreateFrozenBrush(0x01, 0x00, 0x00, 0x00);
     private static readonly Brush MiniDesktopGridCellBorderBrush = CreateFrozenBrush(0x38, 0xFF, 0xFF, 0xFF);
     private static readonly Brush MiniDesktopGridCellFillBrush = CreateFrozenBrush(0x08, 0xFF, 0xFF, 0xFF);
-    private static readonly DropShadowEffect FrostedDropShadow = CreateFrozenDropShadow();
 
     public const string SpecialSettingsId = "__cleanslate_settings__";
 
@@ -348,6 +344,89 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Extracts missing dock item icons on the caller's background STA thread and assigns
+    /// them on the UI Dispatcher in small batches without stalling startup or UI input.
+    /// </summary>
+    public void WarmIconsFromBackgroundSta()
+    {
+        if (Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
+        List<(DockItem Item, string SourcePath, bool IsSettings)> pending = Dispatcher.Invoke(() =>
+        {
+            var list = new List<(DockItem, string, bool)>(_configService.Config.Items.Count);
+            foreach (DockItem item in _configService.Config.Items)
+            {
+                if (item.Icon is not null)
+                {
+                    continue;
+                }
+
+                bool isSettings = string.Equals(item.Id, SpecialSettingsId, StringComparison.OrdinalIgnoreCase);
+                string source = isSettings
+                    ? string.Empty
+                    : (string.IsNullOrWhiteSpace(item.IconPath) ? item.Path : item.IconPath!);
+                list.Add((item, source, isSettings));
+            }
+            return list;
+        });
+
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        const int batchSize = 8;
+        var batch = new List<(DockItem Item, BitmapSource? Icon)>(batchSize);
+
+        foreach ((DockItem item, string sourcePath, bool isSettings) in pending)
+        {
+            if (Dispatcher.HasShutdownStarted || _allowClose)
+            {
+                return;
+            }
+
+            BitmapSource? icon = isSettings
+                ? _iconExtractor.GetSettingsIcon()
+                : _iconExtractor.GetIcon(sourcePath);
+
+            if (icon is not null)
+            {
+                batch.Add((item, icon));
+            }
+
+            if (batch.Count >= batchSize)
+            {
+                CommitIconBatch(batch);
+                batch = new List<(DockItem, BitmapSource?)>(batchSize);
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            CommitIconBatch(batch);
+        }
+    }
+
+    private void CommitIconBatch(List<(DockItem Item, BitmapSource? Icon)> batch)
+    {
+        if (Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
+        _ = Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            foreach ((DockItem item, BitmapSource? icon) in batch)
+            {
+                item.Icon ??= icon;
+            }
+        });
+    }
+
     private static void OnShowSettingsButtonChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is MainWindow mw)
@@ -474,6 +553,7 @@ public partial class MainWindow : Window
             this.Activate();
             this.Focus();
             Keyboard.Focus(_isSearchOpen ? SearchTextBox : this);
+            _lastRevealCompletedTimeMs = Environment.TickCount64;
             return;
         }
 
@@ -504,7 +584,7 @@ public partial class MainWindow : Window
 
             if (snapshot is not null)
             {
-                _activeGenieOverlay = new GenieOverlayWindow(
+                var openingOverlay = new GenieOverlayWindow(
                     snapshot,
                     captureRect,
                     cursorPhysX,
@@ -519,7 +599,6 @@ public partial class MainWindow : Window
                             return;
                         }
 
-                        _activeGenieOverlay = null;
                         try
                         {
                             RevealMainWindowAt(hwnd, physX, physY, physW, physH, scale, visibleRect);
@@ -530,7 +609,15 @@ public partial class MainWindow : Window
                             _isShowing = false;
                         }
                     });
-                _activeGenieOverlay.Start();
+                openingOverlay.Closed += (_, _) =>
+                {
+                    if (ReferenceEquals(_activeGenieOverlay, openingOverlay))
+                    {
+                        _activeGenieOverlay = null;
+                    }
+                };
+                _activeGenieOverlay = openingOverlay;
+                openingOverlay.Start();
             }
             else
             {
@@ -633,12 +720,12 @@ public partial class MainWindow : Window
         ComputeClampedBounds(cursorPhysX, cursorPhysY, out int physX, out int physY, out int physW, out int physH, out double scale);
         NativeMethods.SetWindowPos(
             hwnd,
-            IntPtr.Zero,
+            NativeMethods.HWND_TOPMOST,
             physX,
             physY,
             physW,
             physH,
-            NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+            NativeMethods.SWP_NOACTIVATE);
 
         if (PresentationSource.FromVisual(this)?.CompositionTarget is { } target)
         {
@@ -650,6 +737,23 @@ public partial class MainWindow : Window
         {
             Left = physX / scale;
             Top = physY / scale;
+        }
+
+        UpdateLayout();
+        if (!NativeMethods.GetWindowRect(hwnd, out NativeMethods.RECT actualRect) ||
+            actualRect.Left != physX ||
+            actualRect.Top != physY ||
+            (actualRect.Right - actualRect.Left) != physW ||
+            (actualRect.Bottom - actualRect.Top) != physH)
+        {
+            NativeMethods.SetWindowPos(
+                hwnd,
+                IntPtr.Zero,
+                physX,
+                physY,
+                physW,
+                physH,
+                NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
         }
 
         captureRect = new ScreenBounds(physX, physY, physX + physW, physY + physH);
@@ -2372,14 +2476,14 @@ public partial class MainWindow : Window
 
             if (File.Exists(targetToReveal) || Directory.Exists(targetToReveal))
             {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{targetToReveal}\"")
+                using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{targetToReveal}\"")
                 {
                     UseShellExecute = true
                 });
             }
             else if (Directory.Exists(_configService.ShortcutsDirectory))
             {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_configService.ShortcutsDirectory}\"")
+                using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_configService.ShortcutsDirectory}\"")
                 {
                     UseShellExecute = true
                 });
@@ -2563,28 +2667,17 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (File.Exists(item.Path))
+            if (File.Exists(item.Path) || Directory.Exists(item.Path))
             {
-                FileSystem.DeleteFile(
-                    item.Path,
-                    UIOption.OnlyErrorDialogs,
-                    RecycleOption.SendToRecycleBin);
+                if (!NativeMethods.SendToRecycleBinSilent(item.Path))
+                {
+                    return false;
+                }
             }
-            else if (Directory.Exists(item.Path))
-            {
-                FileSystem.DeleteDirectory(
-                    item.Path,
-                    UIOption.OnlyErrorDialogs,
-                    RecycleOption.SendToRecycleBin);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to send '{item.Path}' to Recycle Bin: {ex.Message}");
+            AppLogger.Warn($"Failed to send '{item.Path}' to Recycle Bin: {ex.Message}");
             return false;
         }
 
@@ -2875,14 +2968,14 @@ public partial class MainWindow : Window
 
         try
         {
-            Process.Start(new ProcessStartInfo("explorer.exe", "shell:RecycleBinFolder")
+            using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", "shell:RecycleBinFolder")
             {
                 UseShellExecute = true
             });
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to open Recycle Bin: {ex.Message}");
+            AppLogger.Warn($"Failed to open Recycle Bin: {ex.Message}");
         }
     }
 
@@ -2901,7 +2994,7 @@ public partial class MainWindow : Window
         {
             if (Directory.Exists(item.Path))
             {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{item.Path}\"")
+                using Process? proc = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{item.Path}\"")
                 {
                     UseShellExecute = true
                 });
@@ -2933,7 +3026,7 @@ public partial class MainWindow : Window
                 startInfo.Verb = "runas";
             }
 
-            Process.Start(startInfo);
+            using Process? started = Process.Start(startInfo);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
@@ -3531,26 +3624,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Never hide if mouse is currently hovering over MainWindow.
-        if (IsMouseOver)
-        {
-            return;
-        }
-
-        // Also check physical cursor position against native window bounds.
-        IntPtr hwnd = new WindowInteropHelper(this).Handle;
-        if (hwnd != IntPtr.Zero && NativeMethods.GetCursorPos(out NativeMethods.POINT pt))
-        {
-            if (NativeMethods.GetWindowRect(hwnd, out NativeMethods.RECT r))
-            {
-                if (pt.X >= r.Left && pt.X <= r.Right && pt.Y >= r.Top && pt.Y <= r.Bottom)
-                {
-                    return;
-                }
-            }
-        }
-
-        // If the newly activated foreground window belongs to CleanSlate, keep the dock open.
+        // If the newly activated foreground window belongs to CleanSlate (e.g. context menu or tray popup), keep the dock open.
         IntPtr fgHwnd = NativeMethods.GetForegroundWindow();
         if (fgHwnd != IntPtr.Zero)
         {
@@ -3562,6 +3636,17 @@ public partial class MainWindow : Window
         }
 
         HideDock();
+    }
+
+    public void ResetTransientInteractionState()
+    {
+        _isShowing = false;
+        _isOpeningGenie = false;
+        _isClosingGenie = false;
+        _isDragging = false;
+        _dragCandidateItem = null;
+        CloseActiveContextMenu();
+        CloseDragOverlays();
     }
 
     private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
@@ -3844,19 +3929,5 @@ public partial class MainWindow : Window
         var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
         brush.Freeze();
         return brush;
-    }
-
-    private static DropShadowEffect CreateFrozenDropShadow()
-    {
-        var shadow = new DropShadowEffect
-        {
-            BlurRadius = 22,
-            ShadowDepth = 4,
-            Direction = 270,
-            Opacity = 0.55,
-            Color = Colors.Black
-        };
-        shadow.Freeze();
-        return shadow;
     }
 }

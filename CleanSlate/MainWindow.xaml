@@ -11,6 +11,8 @@
         Background="Transparent"
         ResizeMode="NoResize"
         SizeToContent="WidthAndHeight"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
         Focusable="True"
         FocusVisualStyle="{x:Null}"
         AllowDrop="True"
@@ -150,39 +152,10 @@
                                 BorderThickness="{TemplateBinding BorderThickness}"
                                 CornerRadius="10"
                                 Padding="6,8"
-                                RenderTransformOrigin="0.5,0.5">
-                            <Border.RenderTransform>
-                                <ScaleTransform ScaleX="1" ScaleY="1" />
-                            </Border.RenderTransform>
+                                RenderOptions.BitmapScalingMode="HighQuality">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Top" />
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Trigger.EnterActions>
-                                    <BeginStoryboard>
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="TileBorder"
-                                                             Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                             To="1.05" Duration="0:0:0.10" />
-                                            <DoubleAnimation Storyboard.TargetName="TileBorder"
-                                                             Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                             To="1.05" Duration="0:0:0.10" />
-                                        </Storyboard>
-                                    </BeginStoryboard>
-                                </Trigger.EnterActions>
-                                <Trigger.ExitActions>
-                                    <BeginStoryboard>
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="TileBorder"
-                                                             Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
-                                                             To="1.0" Duration="0:0:0.12" />
-                                            <DoubleAnimation Storyboard.TargetName="TileBorder"
-                                                             Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
-                                                             To="1.0" Duration="0:0:0.12" />
-                                        </Storyboard>
-                                    </BeginStoryboard>
-                                </Trigger.ExitActions>
-                            </Trigger>
                             <MultiDataTrigger>
                                 <MultiDataTrigger.Conditions>
                                     <Condition Binding="{Binding IsMouseOver, RelativeSource={RelativeSource TemplatedParent}}" Value="True" />
@@ -454,7 +427,39 @@
                                         <StackPanel Orientation="Vertical" HorizontalAlignment="Center">
                                             <Grid Width="{Binding IconSize, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   Height="{Binding IconSize, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                  Margin="0,0,0,6">
+                                                  Margin="0,0,0,6"
+                                                  RenderTransformOrigin="0.5,0.5">
+                                                <Grid.RenderTransform>
+                                                    <ScaleTransform ScaleX="1" ScaleY="1" />
+                                                </Grid.RenderTransform>
+                                                <Grid.Style>
+                                                    <Style TargetType="Grid">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=Button}}" Value="True">
+                                                                <DataTrigger.EnterActions>
+                                                                    <BeginStoryboard>
+                                                                        <Storyboard>
+                                                                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
+                                                                                             To="1.07" Duration="0:0:0.10" />
+                                                                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
+                                                                                             To="1.07" Duration="0:0:0.10" />
+                                                                        </Storyboard>
+                                                                    </BeginStoryboard>
+                                                                </DataTrigger.EnterActions>
+                                                                <DataTrigger.ExitActions>
+                                                                    <BeginStoryboard>
+                                                                        <Storyboard>
+                                                                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
+                                                                                             To="1.0" Duration="0:0:0.12" />
+                                                                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
+                                                                                             To="1.0" Duration="0:0:0.12" />
+                                                                        </Storyboard>
+                                                                    </BeginStoryboard>
+                                                                </DataTrigger.ExitActions>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Grid.Style>
                                                 <Image Source="{Binding Icon}"
                                                        Width="{Binding IconSize, RelativeSource={RelativeSource AncestorType=Window}}"
                                                        Height="{Binding IconSize, RelativeSource={RelativeSource AncestorType=Window}}"
@@ -480,6 +485,7 @@
                                             <TextBlock Text="{Binding Name}"
                                                        FontFamily="Segoe UI Variable Text, Segoe UI"
                                                        FontSize="12"
+                                                       TextOptions.TextFormattingMode="Display"
                                                        Foreground="#F5FFFFFF"
                                                        TextAlignment="Center"
                                                        TextTrimming="CharacterEllipsis"

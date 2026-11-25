@@ -77,39 +77,55 @@ public partial class DragIconOverlay : Window
         int physLeft = cursorPhysX - (physSize / 2);
         int physTop = cursorPhysY - (physSize / 2);
 
+        bool sizeChanged = _pendingPhysSize != physSize;
         _pendingPhysLeft = physLeft;
         _pendingPhysTop = physTop;
         _pendingPhysSize = physSize;
 
-        double dipLeft = physLeft / scale;
-        double dipTop = physTop / scale;
-
-        IntPtr hwnd = new WindowInteropHelper(this).Handle;
-        Left = dipLeft;
-        Top = dipTop;
-
-        if (hwnd == IntPtr.Zero)
-        {
-            if (!IsVisible)
-            {
-                Show();
-            }
-            return;
-        }
+        IntPtr hwnd = new WindowInteropHelper(this).EnsureHandle();
 
         if (!IsVisible)
         {
+            NativeMethods.SetWindowPos(
+                hwnd,
+                NativeMethods.HWND_TOPMOST,
+                physLeft,
+                physTop,
+                physSize,
+                physSize,
+                NativeMethods.SWP_NOACTIVATE);
             Show();
         }
+        else
+        {
+            uint flags = NativeMethods.SWP_NOACTIVATE | (sizeChanged ? 0u : NativeMethods.SWP_NOSIZE);
+            NativeMethods.SetWindowPos(
+                hwnd,
+                NativeMethods.HWND_TOPMOST,
+                physLeft,
+                physTop,
+                physSize,
+                physSize,
+                flags);
+        }
 
-        NativeMethods.SetWindowPos(
-            hwnd,
-            NativeMethods.HWND_TOPMOST,
-            physLeft,
-            physTop,
-            0,
-            0,
-            NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+        if (PresentationSource.FromVisual(this)?.CompositionTarget is { } target)
+        {
+            Point dipOrigin = target.TransformFromDevice.Transform(new Point(physLeft, physTop));
+            Left = dipOrigin.X;
+            Top = dipOrigin.Y;
+        }
+        else
+        {
+            Left = physLeft / scale;
+            Top = physTop / scale;
+        }
+
+        if (sizeChanged)
+        {
+            Width = OverlaySizeDip;
+            Height = OverlaySizeDip;
+        }
     }
 
     public void SetVisibility(bool isVisible)

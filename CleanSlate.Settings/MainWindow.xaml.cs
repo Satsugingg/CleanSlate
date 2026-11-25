@@ -29,9 +29,11 @@ public partial class MainWindow : Window
     }
 
     private readonly SettingsStore _store = new();
+    private readonly UpdateCheckerService _updater = new();
     private readonly DispatcherTimer _iconSizeSaveTimer;
     private readonly DispatcherTimer _customSizeSaveTimer;
     private DockSettingsModel _model = new();
+    private UpdateCheckResult? _pendingUpdate;
     private bool _isInitializing = true;
     private bool _isUpdatingCustomSizeUi;
     private ShortcutCaptureTarget _captureTarget = ShortcutCaptureTarget.None;
@@ -41,6 +43,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        UpdateStatusText.Text = $"Installed version: {UpdateCheckerService.CurrentVersionTag}";
 
         Rect work = SystemParameters.WorkArea;
         MaxHeight = Math.Min(700.0, Math.Max(340.0, work.Height - 24.0));
@@ -721,6 +724,82 @@ public partial class MainWindow : Window
                     ? $"Restored {result.RestoredCount} {itemNoun} & Recycle Bin to their original positions."
                     : $"Restored {result.RestoredCount} {itemNoun} & Recycle Bin onto your desktop.";
         RestoreStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x64, 0xB5, 0xF6));
+    }
+
+    private async void OnCheckForUpdatesClick(object sender, RoutedEventArgs e)
+    {
+        CheckUpdatesButton.IsEnabled = false;
+        InstallUpdateButton.Visibility = Visibility.Collapsed;
+        _pendingUpdate = null;
+        UpdateStatusText.Text = $"Checking GitHub Releases (current: {UpdateCheckerService.CurrentVersionTag})...";
+        UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x64, 0xB5, 0xF6));
+
+        try
+        {
+            UpdateCheckResult result = await _updater.CheckForUpdatesAsync();
+            if (!result.IsUpdateAvailable)
+            {
+                UpdateStatusText.Text = $"You are up to date ({result.CurrentTag}).";
+                UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x81, 0xC7, 0x84));
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(result.DownloadUrl))
+            {
+                UpdateStatusText.Text = $"Release {result.LatestTag} found, but CleanSlate-Setup.exe is not attached yet.";
+                UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xB7, 0x4D));
+                return;
+            }
+
+            _pendingUpdate = result;
+            double sizeMb = result.AssetSizeBytes > 0 ? result.AssetSizeBytes / (1024.0 * 1024.0) : 0;
+            string sizeSuffix = sizeMb > 0 ? $" ({sizeMb:0.0} MB)" : string.Empty;
+            UpdateStatusText.Text = $"Update available: {result.LatestTag}{sizeSuffix}. Click Install Update to upgrade automatically.";
+            UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x81, 0xC7, 0x84));
+            InstallUpdateButton.Visibility = Visibility.Visible;
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusText.Text = $"Update check failed: {ex.Message}";
+            UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50));
+        }
+        finally
+        {
+            CheckUpdatesButton.IsEnabled = true;
+        }
+    }
+
+    private async void OnInstallUpdateClick(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate?.DownloadUrl is not string downloadUrl)
+        {
+            return;
+        }
+
+        CheckUpdatesButton.IsEnabled = false;
+        InstallUpdateButton.IsEnabled = false;
+        UpdateStatusText.Text = $"Downloading {_pendingUpdate.LatestTag}...";
+        UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x64, 0xB5, 0xF6));
+
+        Progress<double> progress = new(percent =>
+        {
+            UpdateStatusText.Text = $"Downloading {_pendingUpdate.LatestTag}... {percent:0}%";
+        });
+
+        try
+        {
+            await _updater.DownloadAndInstallAsync(downloadUrl, progress);
+            UpdateStatusText.Text = "Installing update and restarting CleanSlate...";
+            UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x81, 0xC7, 0x84));
+            Application.Current.Shutdown();
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusText.Text = $"Update failed: {ex.Message}";
+            UpdateStatusText.Foreground = new SolidColorBrush(Color.FromRgb(0xEF, 0x53, 0x50));
+            CheckUpdatesButton.IsEnabled = true;
+            InstallUpdateButton.IsEnabled = true;
+        }
     }
 
     public void FlushPendingIconSizeSave()

@@ -13,18 +13,13 @@ namespace CleanSlate.Services;
 /// Manages persistent JSON state in %LocalAppData%\CleanSlate\config.json,
 /// the managed Shortcuts folder, and Windows HKCU startup registration.
 /// </summary>
-public sealed class ConfigService
+public sealed class ConfigService : IDisposable
 {
     private const string RunRegistryPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     private const string StartupValueName = "CleanSlate";
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        WriteIndented = true,
-        PropertyNameCaseInsensitive = true
-    };
-
     private readonly SemaphoreSlim _saveLock = new(1, 1);
+    private bool _disposed;
     private Dispatcher? _uiDispatcher;
     private int _pendingSaves;
     private long _saveSequence;
@@ -70,7 +65,7 @@ public sealed class ConfigService
         try
         {
             string json = await File.ReadAllTextAsync(ConfigFilePath).ConfigureAwait(false);
-            AppConfig? loaded = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions);
+            AppConfig? loaded = JsonSerializer.Deserialize(json, AppConfigJsonContext.Default.AppConfig);
 
             if (loaded is null)
             {
@@ -145,7 +140,7 @@ public sealed class ConfigService
                 json = reader.ReadToEnd();
             }
 
-            AppConfig? loaded = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions);
+            AppConfig? loaded = JsonSerializer.Deserialize(json, AppConfigJsonContext.Default.AppConfig);
             if (loaded is null)
             {
                 return;
@@ -335,7 +330,7 @@ public sealed class ConfigService
 
             foreach (JsonElement itemElem in itemsElem.EnumerateArray())
             {
-                DockItem? item = itemElem.Deserialize<DockItem>(JsonOptions);
+                DockItem? item = itemElem.Deserialize(AppConfigJsonContext.Default.DockItem);
                 if (item is not null &&
                     !string.IsNullOrWhiteSpace(item.Path) &&
                     seenPaths.Add(item.Path))
@@ -394,6 +389,11 @@ public sealed class ConfigService
     /// </summary>
     public void FlushPendingSave()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         try
         {
             EnsureDirectories();
@@ -418,8 +418,20 @@ public sealed class ConfigService
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"FlushPendingSave failed: {ex.Message}");
+            AppLogger.Warn($"FlushPendingSave failed: {ex.Message}");
         }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        FlushPendingSave();
+        _disposed = true;
+        _saveLock.Dispose();
     }
 
     private void RecordDiskSnapshotStamp()
@@ -478,6 +490,6 @@ public sealed class ConfigService
             Items = new ObservableCollection<DockItem>(
                 config.Items.Where(i => !string.Equals(i.Id, "__cleanslate_settings__", StringComparison.OrdinalIgnoreCase)))
         };
-        return JsonSerializer.Serialize(clone, JsonOptions);
+        return JsonSerializer.Serialize(clone, AppConfigJsonContext.Default.AppConfig);
     }
 }

@@ -21,6 +21,7 @@ public partial class App : Application
     private DesktopWatcher? _desktopWatcher;
     private TrayIconManager? _trayIconManager;
     private bool _isShuttingDown;
+    private bool _resourcesCleanedUp;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -42,6 +43,7 @@ public partial class App : Application
         }
 
         DispatcherUnhandledException += OnDispatcherUnhandledException;
+        SessionEnding += OnSessionEnding;
 
         try
         {
@@ -65,17 +67,6 @@ public partial class App : Application
                 }
             };
 
-            if (_configService.Config.Settings.AutoIngestDesktop)
-            {
-                // Start ingester before hiding Recycle Bin so DesktopPositionHelper captures
-                // Recycle Bin & desktop file coordinates prior to Shell refresh.
-                _desktopWatcher.Start();
-                DesktopIconHelper.HideDesktopRecycleBin();
-            }
-
-            // Warm icon cache for any remaining configured items after startup.
-            _ = Dispatcher.BeginInvoke(DispatcherPriority.Background, () => _mainWindow.PreloadIcons());
-
             _desktopHook = new DesktopHook(Dispatcher);
             _desktopHook.RegisterDismissHandler(() => _mainWindow.HideDock());
             _mainWindow.DockBoundsChanged += (_, args) =>
@@ -94,16 +85,19 @@ public partial class App : Application
                 () => _mainWindow.OpenRecycleBinFolder());
             _trayIconManager.Initialize();
 
-            string? currentExe = Environment.ProcessPath;
-            if (!string.IsNullOrWhiteSpace(currentExe))
-            {
-                bool startupEnabled = _configService.Config.Settings.AutoLaunchOnStartup;
-                _ = Task.Run(() => WindowsStartupHelper.ApplyStartupRegistration(currentExe, startupEnabled));
-            }
+            // Defer heavy Shell COM enumeration, Desktop ingestion, startup verification, and icon warmup
+            // onto a dedicated background STA worker so mouse hook & tray icon are interactive immediately.
+            StartBackgroundColdBootWorker(
+                _configService,
+                _desktopWatcher,
+                _mainWindow,
+                _configService.Config.Settings.AutoIngestDesktop,
+                _configService.Config.Settings.AutoLaunchOnStartup,
+                Environment.ProcessPath);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"CleanSlate startup failed: {ex}");
+            AppLogger.Error("CleanSlate startup failed", ex);
             MessageBox.Show(
                 $"CleanSlate failed to initialize:\n{ex.Message}",
                 "CleanSlate",
@@ -111,6 +105,61 @@ public partial class App : Application
                 MessageBoxImage.Error);
             ShutdownApplication();
         }
+    }
+
+    private void StartBackgroundColdBootWorker(
+        ConfigService configService,
+        DesktopWatcher desktopWatcher,
+        MainWindow mainWindow,
+        bool autoIngestDesktop,
+        bool autoLaunchOnStartup,
+        string? currentExe)
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (_isShuttingDown)
+                {
+                    return;
+                }
+
+                if (autoIngestDesktop)
+                {
+                    // Start ingester before hiding Recycle Bin so DesktopPositionHelper captures
+                    // Recycle Bin & desktop file coordinates prior to Shell refresh.
+                    desktopWatcher.Start();
+                    DesktopIconHelper.HideDesktopRecycleBin();
+                }
+
+                if (_isShuttingDown)
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(currentExe))
+                {
+                    WindowsStartupHelper.ApplyStartupRegistration(currentExe, autoLaunchOnStartup);
+                }
+
+                if (_isShuttingDown)
+                {
+                    return;
+                }
+
+                mainWindow.WarmIconsFromBackgroundSta();
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error("Background cold-boot worker error", ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "CleanSlate.ColdBootSta"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
     }
 
     private void SyncFromExternalSettingsChange()
@@ -221,8 +270,21 @@ public partial class App : Application
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
-        Debug.WriteLine($"Unhandled UI exception: {e.Exception}");
+        AppLogger.Error("Unhandled UI exception", e.Exception);
+        try
+        {
+            _mainWindow?.ResetTransientInteractionState();
+        }
+        catch
+        {
+            // Ignore secondary state-reset failures during exception handling.
+        }
         e.Handled = true;
+    }
+
+    private void OnSessionEnding(object sender, SessionEndingCancelEventArgs e)
+    {
+        CleanupResources();
     }
 
     public void ShutdownApplication()
@@ -245,7 +307,12 @@ public partial class App : Application
 
     private void CleanupResources()
     {
-        _configService?.FlushPendingSave();
+        if (_resourcesCleanedUp)
+        {
+            return;
+        }
+
+        _resourcesCleanedUp = true;
 
         _desktopHook?.Dispose();
         _desktopHook = null;
@@ -262,6 +329,9 @@ public partial class App : Application
             _mainWindow.Close();
             _mainWindow = null;
         }
+
+        _configService?.Dispose();
+        _configService = null;
 
         if (_instanceMutex is not null)
         {

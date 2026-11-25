@@ -10,7 +10,12 @@
     <ApplicationIcon>..\CleanSlate\Assets\CleanSlate.ico</ApplicationIcon>
     <AssemblyName>CleanSlate.Settings</AssemblyName>
     <RootNamespace>CleanSlate.Settings</RootNamespace>
+    <Version>1.1.0</Version>
     <Platforms>AnyCPU;x64</Platforms>
+    <TieredCompilation>true</TieredCompilation>
+    <TieredCompilationQuickJit>true</TieredCompilationQuickJit>
+    <TieredPGO>true</TieredPGO>
+    <PublishReadyToRun Condition="'$(RuntimeIdentifier)' != '' and '$(Configuration)' == 'Release'">true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>

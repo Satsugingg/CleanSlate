@@ -124,10 +124,12 @@ public static class DesktopPositionHelper
     private static Dictionary<string, DesktopIconPoint> CaptureDesktopPositionsCore()
     {
         var result = new Dictionary<string, DesktopIconPoint>(StringComparer.OrdinalIgnoreCase);
+        IFolderView? folderView = null;
+        IShellFolder? shellFolder = null;
 
         try
         {
-            if (!TryGetDesktopViewAndFolder(out IFolderView? folderView, out IShellFolder? shellFolder) ||
+            if (!TryGetDesktopViewAndFolder(out folderView, out shellFolder) ||
                 folderView is null || shellFolder is null)
             {
                 return result;
@@ -173,6 +175,11 @@ public static class DesktopPositionHelper
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"Failed capturing desktop positions: {ex.Message}");
+        }
+        finally
+        {
+            ReleaseCom(shellFolder);
+            ReleaseCom(folderView);
         }
 
         return result;
@@ -227,9 +234,11 @@ public static class DesktopPositionHelper
 
         while (true)
         {
+            IFolderView? folderView = null;
+            IShellFolder? shellFolder = null;
             try
             {
-                if (TryGetDesktopViewAndFolder(out IFolderView? folderView, out IShellFolder? shellFolder) &&
+                if (TryGetDesktopViewAndFolder(out folderView, out shellFolder) &&
                     folderView is not null && shellFolder is not null)
                 {
                     autoArrangeEnabled = folderView.GetAutoArrange() == 0;
@@ -246,6 +255,11 @@ public static class DesktopPositionHelper
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"RestoreDesktopPositions pass error: {ex.Message}");
+            }
+            finally
+            {
+                ReleaseCom(shellFolder);
+                ReleaseCom(folderView);
             }
 
             bool remainingMissing = matchedKeys.Count < normalizedTargets.Count;
@@ -390,57 +404,91 @@ public static class DesktopPositionHelper
         folderView = null;
         shellFolder = null;
 
-        Type? shellWindowsType = Type.GetTypeFromCLSID(ClsidShellWindows);
-        if (shellWindowsType is null)
+        object? shellWindowsObj = null;
+        object? desktopDisp = null;
+        object? browserObj = null;
+        object? shellViewObj = null;
+        object? folderObj = null;
+
+        try
         {
-            return false;
-        }
+            Type? shellWindowsType = Type.GetTypeFromCLSID(ClsidShellWindows);
+            if (shellWindowsType is null)
+            {
+                return false;
+            }
 
-        object? shellWindowsObj = Activator.CreateInstance(shellWindowsType);
-        if (shellWindowsObj is not IShellWindows shellWindows)
+            shellWindowsObj = Activator.CreateInstance(shellWindowsType);
+            if (shellWindowsObj is not IShellWindows shellWindows)
+            {
+                return false;
+            }
+
+            object loc = null!;
+            object root = null!;
+            int hrFind = shellWindows.FindWindowSW(
+                ref loc,
+                ref root,
+                SwcDesktop,
+                out _,
+                SwfoNeedDispatch,
+                out desktopDisp);
+
+            if (hrFind != 0 || desktopDisp is not IServiceProvider serviceProvider)
+            {
+                return false;
+            }
+
+            Guid sidTopLevel = SidTopLevelBrowser;
+            Guid iidBrowser = IidIShellBrowser;
+            int hrService = serviceProvider.QueryService(ref sidTopLevel, ref iidBrowser, out browserObj);
+            if (hrService != 0 || browserObj is not IShellBrowser shellBrowser)
+            {
+                return false;
+            }
+
+            if (shellBrowser.QueryActiveShellView(out shellViewObj) != 0 ||
+                shellViewObj is not IFolderView view)
+            {
+                return false;
+            }
+
+            Guid iidFolder = IidIShellFolder;
+            if (view.GetFolder(ref iidFolder, out folderObj) != 0 ||
+                folderObj is not IShellFolder folder)
+            {
+                return false;
+            }
+
+            folderView = view;
+            shellFolder = folder;
+            shellViewObj = null;
+            folderObj = null;
+            return true;
+        }
+        finally
         {
-            return false;
+            ReleaseCom(folderObj);
+            ReleaseCom(shellViewObj);
+            ReleaseCom(browserObj);
+            ReleaseCom(desktopDisp);
+            ReleaseCom(shellWindowsObj);
         }
+    }
 
-        object loc = null!;
-        object root = null!;
-        int hrFind = shellWindows.FindWindowSW(
-            ref loc,
-            ref root,
-            SwcDesktop,
-            out _,
-            SwfoNeedDispatch,
-            out object? desktopDisp);
-
-        if (hrFind != 0 || desktopDisp is not IServiceProvider serviceProvider)
+    private static void ReleaseCom(object? comObj)
+    {
+        if (comObj is not null && Marshal.IsComObject(comObj))
         {
-            return false;
+            try
+            {
+                Marshal.ReleaseComObject(comObj);
+            }
+            catch
+            {
+                // Ignore COM release errors during shell/process teardown.
+            }
         }
-
-        Guid sidTopLevel = SidTopLevelBrowser;
-        Guid iidBrowser = IidIShellBrowser;
-        int hrService = serviceProvider.QueryService(ref sidTopLevel, ref iidBrowser, out object? browserObj);
-        if (hrService != 0 || browserObj is not IShellBrowser shellBrowser)
-        {
-            return false;
-        }
-
-        if (shellBrowser.QueryActiveShellView(out object? shellViewObj) != 0 ||
-            shellViewObj is not IFolderView view)
-        {
-            return false;
-        }
-
-        Guid iidFolder = IidIShellFolder;
-        if (view.GetFolder(ref iidFolder, out object? folderObj) != 0 ||
-            folderObj is not IShellFolder folder)
-        {
-            return false;
-        }
-
-        folderView = view;
-        shellFolder = folder;
-        return true;
     }
 
     private static string? GetParsingName(IShellFolder shellFolder, IntPtr pidl)
