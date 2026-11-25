@@ -10,7 +10,7 @@
     <ApplicationIcon>Assets\CleanSlate.ico</ApplicationIcon>
     <AssemblyName>CleanSlate</AssemblyName>
     <RootNamespace>CleanSlate</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Platforms>AnyCPU;x64</Platforms>
     <TieredCompilation>true</TieredCompilation>
     <TieredCompilationQuickJit>true</TieredCompilationQuickJit>

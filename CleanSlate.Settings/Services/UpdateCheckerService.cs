@@ -4,7 +4,6 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text.Json;
-using Microsoft.Win32;
 
 namespace CleanSlate.Settings.Services;
 
@@ -19,7 +18,6 @@ public sealed record UpdateCheckResult(
 public sealed class UpdateCheckerService
 {
     private const string LatestReleaseApiUrl = "https://api.github.com/repos/Satsugingg/CleanSlate/releases/latest";
-    private const string UninstallRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CleanSlate";
     private const string SetupAssetName = "CleanSlate-Setup.exe";
 
     private static readonly HttpClient HttpClient = CreateHttpClient();
@@ -170,20 +168,6 @@ public sealed class UpdateCheckerService
 
     private static string ResolveInstallDirectory()
     {
-        try
-        {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(UninstallRegistryPath, writable: false);
-            string? regDir = key?.GetValue("InstallLocation") as string;
-            if (!string.IsNullOrWhiteSpace(regDir) && Directory.Exists(regDir))
-            {
-                return Path.GetFullPath(regDir);
-            }
-        }
-        catch
-        {
-            // Fall back to current application directory.
-        }
-
         return Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
     }
 

@@ -10,7 +10,7 @@
     <AssemblyName>CleanSlate-Setup</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RootNamespace>CleanSlate.Installer</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Platforms>AnyCPU;x64</Platforms>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>

@@ -5,7 +5,6 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
-using Microsoft.Win32;
 
 namespace CleanSlate.Core;
 
@@ -13,17 +12,12 @@ namespace CleanSlate.Core;
 /// Configures high-performance instant boot startup for CleanSlate via:
 /// 1. Windows Task Scheduler 2.0 COM logon task (via direct IDispatch without loading Microsoft.CSharp DLR),
 ///    releasing all COM RCWs deterministically and skipping redundant writes if already up-to-date.
-/// 2. Explorer Startup Delay elimination (HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize\StartupDelayInMSec = 0).
-/// 3. Traditional HKCU Run registry key fallback when Task Scheduler registration fails.
+/// 2. Windows Startup folder shortcut fallback when Task Scheduler registration fails (without touching HKCU Run/Serialize keys).
 /// </summary>
 public static class WindowsStartupHelper
 {
     public const string TaskName = "CleanSlate";
-    public const string StartupValueName = "CleanSlate";
     private const string StartupArguments = "--startup";
-    private const string RunRegistryPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
-    private const string SerializeRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize";
-    private const string StartupDelayValueName = "StartupDelayInMSec";
 
     public static void ApplyStartupRegistration(string exePath, bool enabled)
     {
@@ -35,44 +29,17 @@ public static class WindowsStartupHelper
         if (enabled)
         {
             bool taskReady = IsLogonTaskConfigured(exePath, StartupArguments) || RegisterLogonTask(exePath);
-            SetExplorerStartupDelayBypass(enabled: true);
-
-            if (taskReady)
-            {
-                // When Task Scheduler provides zero-delay logon startup, remove any HKCU Run duplicate.
-                SetRunRegistryKey(exePath, enabled: false);
-            }
-            else
-            {
-                // Fallback to traditional Run registry key if Task Scheduler is unavailable.
-                SetRunRegistryKey(exePath, enabled: true);
-            }
+            // Only use Startup folder shortcut fallback if Task Scheduler is unavailable.
+            SetStartupShortcut(exePath, enabled: !taskReady);
         }
         else
         {
             UnregisterLogonTask();
-            SetRunRegistryKey(exePath, enabled: false);
-            SetExplorerStartupDelayBypass(enabled: false);
+            SetStartupShortcut(exePath, enabled: false);
         }
     }
 
-    public static bool IsStartupEnabled()
-    {
-        if (IsLogonTaskRegistered())
-        {
-            return true;
-        }
-
-        try
-        {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
-            return key?.GetValue(StartupValueName) is string val && !string.IsNullOrWhiteSpace(val);
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    public static bool IsStartupEnabled() => IsLogonTaskRegistered() || IsStartupShortcutPresent();
 
     public static bool IsLogonTaskRegistered() => IsLogonTaskConfigured(expectedExePath: null, expectedArgs: null);
 
@@ -261,68 +228,64 @@ public static class WindowsStartupHelper
         }
     }
 
-    public static void SetExplorerStartupDelayBypass(bool enabled)
-    {
-        try
-        {
-            if (enabled)
-            {
-                using RegistryKey? existingKey = Registry.CurrentUser.OpenSubKey(SerializeRegistryPath, writable: false);
-                if (existingKey?.GetValue(StartupDelayValueName) is int current && current == 0)
-                {
-                    return;
-                }
+    private static string GetStartupShortcutPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "CleanSlate.lnk");
 
-                using RegistryKey? key = Registry.CurrentUser.CreateSubKey(SerializeRegistryPath, writable: true);
-                key?.SetValue(StartupDelayValueName, 0, RegistryValueKind.DWord);
-            }
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Failed to configure Explorer startup delay bypass: {ex.Message}");
-        }
-    }
+    private static bool IsStartupShortcutPresent() => File.Exists(GetStartupShortcutPath());
 
-    public static void SetRunRegistryKey(string exePath, bool enabled)
+    private static void SetStartupShortcut(string exePath, bool enabled)
     {
+        string shortcutPath = GetStartupShortcutPath();
+        var comRefs = new List<object?>(4);
         try
         {
             if (!enabled)
             {
-                using RegistryKey? readKey = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: false);
-                if (readKey?.GetValue(StartupValueName) is null)
+                if (File.Exists(shortcutPath))
                 {
-                    return;
+                    File.Delete(shortcutPath);
                 }
+                return;
             }
 
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: true)
-                ?? Registry.CurrentUser.CreateSubKey(RunRegistryPath);
-
-            if (key is null)
+            if (File.Exists(shortcutPath))
             {
                 return;
             }
 
-            if (enabled)
+            Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null)
             {
-                string desired = $"\"{exePath}\" {StartupArguments}";
-                if (key.GetValue(StartupValueName) is string current &&
-                    string.Equals(current, desired, StringComparison.Ordinal))
-                {
-                    return;
-                }
+                return;
+            }
 
-                key.SetValue(StartupValueName, desired);
-            }
-            else
+            object? shell = Activator.CreateInstance(shellType);
+            if (shell is null)
             {
-                key.DeleteValue(StartupValueName, throwOnMissingValue: false);
+                return;
             }
+            comRefs.Add(shell);
+
+            object? shortcut = InvokeMethod(shell, "CreateShortcut", comRefs, shortcutPath);
+            if (shortcut is null)
+            {
+                return;
+            }
+
+            SetProperty(shortcut, "TargetPath", exePath);
+            SetProperty(shortcut, "Arguments", StartupArguments);
+            SetProperty(shortcut, "WorkingDirectory", Path.GetDirectoryName(exePath) ?? string.Empty);
+            SetProperty(shortcut, "Description", "CleanSlate Desktop Dock");
+            SetProperty(shortcut, "IconLocation", $"{exePath},0");
+            _ = InvokeMethod(shortcut, "Save", comRefs);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to configure Run registry key: {ex.Message}");
+            Debug.WriteLine($"Failed to configure startup shortcut: {ex.Message}");
+        }
+        finally
+        {
+            ReleaseAllCom(comRefs);
         }
     }
 
